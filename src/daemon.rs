@@ -88,6 +88,9 @@ struct State {
     next_pane: u32,
     clock: u64,
     events: UnboundedSender<Event>,
+    /// `general.shell` (else `$SHELL`) and `general.scrollback`, read at startup.
+    shell: Option<String>,
+    scrollback: usize,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -110,6 +113,10 @@ async fn serve() -> Result<()> {
     let listener = UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
 
+    let (config, warning) = crate::config::Config::load_or_default();
+    if let Some(w) = warning {
+        eprintln!("{w}");
+    }
     let (events_tx, mut events_rx) = unbounded_channel();
     let state: Shared = Arc::new(Mutex::new(State {
         panes: HashMap::new(),
@@ -118,6 +125,8 @@ async fn serve() -> Result<()> {
         next_pane: 1,
         clock: 0,
         events: events_tx,
+        shell: config.general.shell,
+        scrollback: config.general.scrollback,
     }));
 
     let pump_state = state.clone();
@@ -315,7 +324,7 @@ impl State {
         let env = profile::spawn_env(profile)?;
         let (rows, cols) = (rows.max(1), cols.max(1));
         let pair = native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let shell = self.shell.clone().or_else(|| std::env::var("SHELL").ok()).unwrap_or_else(|| "/bin/sh".into());
         let mut cmd = CommandBuilder::new(&shell);
         cmd.arg("-l");
         if Path::new(cwd).is_dir() {
@@ -356,7 +365,7 @@ impl State {
             master: pair.master,
             writer,
             child,
-            parser: vt100::Parser::new(rows, cols, 0),
+            parser: vt100::Parser::new(rows, cols, self.scrollback),
         });
         Ok((id, env.color))
     }

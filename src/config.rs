@@ -3,9 +3,6 @@
 //! Every section and key is optional; anything missing takes its default.
 //! Parse errors carry the TOML line/column so they can be shown as-is.
 
-// Parts of this API are consumed by the TUI client as it gets wired in.
-#![allow(dead_code)]
-
 use crate::profile;
 use anyhow::{Context, Result, anyhow, bail};
 use ratatui::style::Color;
@@ -594,7 +591,7 @@ impl Theme {
         Some(match name {
             "default" => Theme {
                 tab_bar_bg: C(Color::Reset),
-                tab_bar_fg: C(Color::Gray),
+                tab_bar_fg: C(Color::Reset),
                 tab_active_bg: Profile,
                 tab_active_fg: C(Color::Black),
                 status_bg: C(Color::Indexed(236)),

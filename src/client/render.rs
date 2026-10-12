@@ -1,7 +1,9 @@
 //! Drawing: tab bar, the active tab's panes with borders, status bar, picker.
+//! Colours come from the config theme; status bar segments from `[status]`.
 
 use super::input::Mode;
 use super::{App, picker_options};
+use crate::config::{Action, Keys, Segment};
 use crate::layout;
 use crate::protocol::TabInfo;
 use ratatui::Frame;
@@ -11,8 +13,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
-const BORDER: Color = Color::Indexed(240);
-
 pub fn draw(app: &App, f: &mut Frame) {
     let [tabs_area, pane_area, status_area] =
         Split::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
@@ -20,56 +20,188 @@ pub fn draw(app: &App, f: &mut Frame) {
         f.render_widget(Paragraph::new(" connecting…"), pane_area);
         return;
     };
+    let theme = &app.config.theme;
     let active = layout.tabs.get(layout.active);
+    let pcolor = active.map(|t| color(&t.color)).unwrap_or(Color::Gray);
 
     // Tab bar: each tab shows its number and profile, in the profile's colour.
+    let bar = Style::new().bg(theme.tab_bar_bg.to_color(pcolor)).fg(theme.tab_bar_fg.to_color(pcolor));
     let mut spans = vec![Span::styled(" oUI ", Style::new().add_modifier(Modifier::BOLD))];
     for (i, t) in layout.tabs.iter().enumerate() {
         let c = color(&t.color);
         let style = if i == layout.active {
-            Style::new().bg(c).fg(Color::Black).add_modifier(Modifier::BOLD)
+            Style::new()
+                .bg(theme.tab_active_bg.to_color(c))
+                .fg(theme.tab_active_fg.to_color(c))
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::new().fg(c)
         };
         spans.push(Span::styled(format!(" {} {} ", i + 1, t.profile), style));
         spans.push(Span::raw(" "));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), tabs_area);
+    f.render_widget(Paragraph::new(Line::from(spans)).style(bar), tabs_area);
 
     if let Some(tab) = active {
         draw_tab(app, tab, pane_area, f);
     }
 
-    // Status bar.
-    let (pname, pcolor) = active.map(|t| (t.profile.as_str(), color(&t.color))).unwrap_or(("-", Color::Gray));
-    let mode = match app.input.mode {
-        Mode::Normal => Span::raw(""),
-        _ => Span::styled(" PREFIX ", Style::new().bg(Color::Yellow).fg(Color::Black)),
-    };
-    let zoom = match active {
-        Some(t) if t.zoomed => Span::styled(" ZOOM ", Style::new().bg(pcolor).fg(Color::Black)),
-        _ => Span::raw(""),
-    };
-    let left = Line::from(vec![
-        mode,
-        zoom,
-        Span::styled(format!(" {} ", layout.session), Style::new().add_modifier(Modifier::BOLD)),
-        Span::raw("│"),
-        Span::styled(format!(" ● {pname} "), Style::new().fg(pcolor)),
-    ]);
-    let hint = app
-        .flash
-        .clone()
-        .unwrap_or_else(|| "^b c tab · %/\" split · ←↓↑→ focus · z zoom · x close · d detach ".into());
-    let [l, r] =
-        Split::horizontal([Constraint::Min(1), Constraint::Length(hint.chars().count() as u16)]).areas(status_area);
-    let bar = Style::new().bg(Color::Indexed(236));
+    // Status bar: left segments, then right segments flush right. A flash
+    // message takes the place of the hints (or leads the right side).
+    let ctx = StatusCtx { app, active, pcolor };
+    let left = ctx.line(&app.config.status.left, None);
+    let flash = app.flash.as_deref().map(|m| m.replace('\n', " · "));
+    let right = ctx.line(&app.config.status.right, flash.as_deref());
+    let [l, r] = Split::horizontal([Constraint::Min(1), Constraint::Length(right.width() as u16)]).areas(status_area);
+    let bar = Style::new().bg(theme.status_bg.to_color(pcolor)).fg(theme.status_fg.to_color(pcolor));
     f.render_widget(Paragraph::new(left).style(bar), l);
-    f.render_widget(Paragraph::new(hint).style(bar.fg(Color::Gray)), r);
+    f.render_widget(Paragraph::new(right).style(bar), r);
 
     if let Mode::Picker(sel) = app.input.mode {
         draw_picker(f, sel);
     }
+}
+
+struct StatusCtx<'a> {
+    app: &'a App,
+    active: Option<&'a TabInfo>,
+    pcolor: Color,
+}
+
+impl StatusCtx<'_> {
+    /// Segments joined by "│"; the mode badge needs no separator.
+    fn line(&self, segments: &[Segment], flash: Option<&str>) -> Line<'static> {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut flash = flash;
+        let mut need_sep = false;
+        let mut push = |spans: &mut Vec<Span<'static>>, seg: Vec<Span<'static>>, badge: bool| {
+            if seg.is_empty() {
+                return;
+            }
+            if need_sep && !badge {
+                spans.push(Span::raw("│"));
+            }
+            need_sep = !badge;
+            spans.extend(seg);
+        };
+        if let Some(m) = flash.filter(|_| !segments.contains(&Segment::Hints)) {
+            push(&mut spans, vec![Span::raw(format!(" {m} "))], false);
+            flash = None;
+        }
+        for seg in segments {
+            let badge = *seg == Segment::Mode;
+            let s = match (seg, flash.take_if(|_| *seg == Segment::Hints)) {
+                (_, Some(m)) => vec![Span::raw(format!(" {m} "))],
+                _ => self.segment(seg),
+            };
+            push(&mut spans, s, badge);
+        }
+        Line::from(spans)
+    }
+
+    fn segment(&self, seg: &Segment) -> Vec<Span<'static>> {
+        let app = self.app;
+        let theme = &app.config.theme;
+        let badge = |text: &str, bg: Color| {
+            Span::styled(format!(" {text} "), Style::new().bg(bg).fg(theme.tab_active_fg.to_color(self.pcolor)))
+        };
+        match seg {
+            Segment::Mode => {
+                let mut v = Vec::new();
+                if !matches!(app.input.mode, Mode::Normal) {
+                    v.push(badge("PREFIX", theme.accent.to_color(self.pcolor)));
+                }
+                if self.active.is_some_and(|t| t.zoomed) {
+                    v.push(badge("ZOOM", self.pcolor));
+                }
+                v
+            }
+            Segment::Session => {
+                let name = app.layout.as_ref().map(|l| l.session.clone()).unwrap_or_default();
+                vec![Span::styled(format!(" {name} "), Style::new().add_modifier(Modifier::BOLD))]
+            }
+            Segment::Profile => {
+                let name = self.active.map(|t| t.profile.as_str()).unwrap_or("-");
+                vec![Span::styled(format!(" ● {name} "), Style::new().fg(self.pcolor))]
+            }
+            Segment::Hints => vec![Span::raw(format!("{} ", hints(&app.input.keys)))],
+            Segment::Clock => vec![Span::raw(format!(" {} ", clock()))],
+            Segment::Hostname => vec![Span::raw(format!(" {} ", app.hostname))],
+            Segment::TabsCount => {
+                let n = app.layout.as_ref().map_or(0, |l| l.tabs.len());
+                vec![Span::raw(format!(" {n} tab{} ", if n == 1 { "" } else { "s" }))]
+            }
+            Segment::Text(t) => vec![Span::raw(t.clone())],
+            // The client doesn't know the focused shell's directory.
+            Segment::Cwd => vec![],
+        }
+    }
+}
+
+/// Key hints from the actual bindings, e.g.
+/// `^b c tab · %/" split · ←↓↑→ focus · z zoom · x close · d detach`.
+pub fn hints(keys: &Keys) -> String {
+    let key = |a: Action| keys.key_for(a).map(display_key);
+    let mut parts = vec![display_key(&keys.prefix.notation)];
+    let mut add = |keys: Vec<Option<String>>, label: &str, sep: &str| {
+        let keys: Vec<String> = keys.into_iter().flatten().collect();
+        if !keys.is_empty() {
+            parts.push(format!("{} {label}", keys.join(sep)));
+        }
+    };
+    add(vec![key(Action::NewTab)], "tab", "");
+    add(vec![key(Action::SplitRight), key(Action::SplitDown)], "split", "/");
+    let focus = vec![key(Action::FocusLeft), key(Action::FocusDown), key(Action::FocusUp), key(Action::FocusRight)];
+    let all_arrows = focus.iter().all(|k| k.as_ref().is_some_and(|k| "←↓↑→".contains(k.as_str())));
+    add(focus, "focus", if all_arrows { "" } else { "/" });
+    add(vec![key(Action::Zoom)], "zoom", "");
+    add(vec![key(Action::ClosePane)], "close", "");
+    add(vec![key(Action::Detach)], "detach", "");
+    // "^b c tab · …": the prefix leads the first hint without a separator.
+    let first = parts.remove(0);
+    match parts.split_first() {
+        Some((h, rest)) => std::iter::once(format!("{first} {h}")).chain(rest.iter().cloned()).collect::<Vec<_>>().join(" · "),
+        None => first,
+    }
+}
+
+/// Short form of a key for hints: "C-b" → "^b", "Left" → "←".
+fn display_key(notation: &str) -> String {
+    match notation {
+        "Left" => "←".into(),
+        "Down" => "↓".into(),
+        "Up" => "↑".into(),
+        "Right" => "→".into(),
+        n => match n.strip_prefix("C-") {
+            Some(rest) if !rest.is_empty() => format!("^{rest}"),
+            _ => n.into(),
+        },
+    }
+}
+
+/// Local time as HH:MM.
+fn clock() -> String {
+    // SAFETY: time/localtime_r write only into the provided, zeroed struct.
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return String::new();
+        }
+        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+    }
+}
+
+/// Short host name (up to the first dot).
+pub fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most buf.len() bytes into buf.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return String::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]);
+    name.split('.').next().unwrap_or_default().to_string()
 }
 
 /// Draw the tab's panes at their rects, borders between them (the focused
@@ -86,7 +218,9 @@ fn draw_tab(app: &App, tab: &TabInfo, area: Rect, f: &mut Frame) {
     }
     if visible.len() > 1 {
         let focused = tab.panes.iter().find(|p| p.id == tab.focused).map(|p| to_screen(p.rect));
-        draw_borders(&visible.iter().map(|p| to_screen(p.rect)).collect::<Vec<_>>(), focused, color(&tab.color), area, f.buffer_mut());
+        let (theme, c) = (&app.config.theme, color(&tab.color));
+        let colors = (theme.border.to_color(c), theme.focused_border.to_color(c));
+        draw_borders(&visible.iter().map(|p| to_screen(p.rect)).collect::<Vec<_>>(), focused, colors, area, f.buffer_mut());
     }
 
     let focused = visible.iter().find(|p| p.id == tab.focused);
@@ -104,7 +238,8 @@ fn draw_tab(app: &App, tab: &TabInfo, area: Rect, f: &mut Frame) {
 
 /// Every cell of `area` not covered by a pane is a border; pick the box char
 /// from which neighbouring cells are borders too.
-fn draw_borders(panes: &[Rect], focused: Option<Rect>, accent: Color, area: Rect, buf: &mut Buffer) {
+/// `colors` is (border, focused border).
+fn draw_borders(panes: &[Rect], focused: Option<Rect>, colors: (Color, Color), area: Rect, buf: &mut Buffer) {
     let inside = |r: &Rect, x: i32, y: i32| {
         x >= r.x as i32 && y >= r.y as i32 && x < (r.x + r.width) as i32 && y < (r.y + r.height) as i32
     };
@@ -131,7 +266,7 @@ fn draw_borders(panes: &[Rect], focused: Option<Rect>, accent: Color, area: Rect
                 _ => "│",
             };
             let near_focus = focused.is_some_and(|r| (-1..=1).any(|dy| (-1..=1).any(|dx| inside(&r, xi + dx, yi + dy))));
-            let fg = if near_focus { accent } else { BORDER };
+            let fg = if near_focus { colors.1 } else { colors.0 };
             buf[(x, y)].set_symbol(sym).set_style(Style::new().fg(fg));
         }
     }
@@ -201,5 +336,22 @@ fn render_screen(screen: &vt100::Screen, area: Rect, buf: &mut Buffer) {
             let sym = if cell.has_contents() { cell.contents() } else { " " };
             buf[(area.x + col, area.y + row)].set_symbol(sym).set_style(style);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn hints_follow_bindings() {
+        assert_eq!(hints(&Keys::default()), "^b c tab · %/\" split · ←↓↑→ focus · z zoom · x close · d detach");
+        let c = Config::parse(
+            "[keys]\nprefix = \"C-a\"\n[keys.bindings]\nv = \"split-right\"\n\"%\" = \"none\"\n\"|\" = \"none\"\nUp = \"none\"\nz = \"none\"",
+            None,
+        )
+        .unwrap();
+        assert_eq!(hints(&c.keys), "^a c tab · v/\" split · ←/↓/k/→ focus · x close · d detach");
     }
 }

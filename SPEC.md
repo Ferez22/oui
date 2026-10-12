@@ -76,7 +76,7 @@ An **isolation test suite** runs each supported tool in two profiles and checks 
 
 ## Sessions (tmux-style)
 - Hierarchy: **Session → Tabs → Panes**. Each tab runs one profile; tab label shows profile name + color.
-- Prefix key (default `Ctrl-b`), configurable.
+- Prefix key (default `Ctrl-b`), configurable. Default keys after the prefix: `c` new tab, `n`/`p`/`1-9` switch tab, `%`/`|` split right, `"`/`-` split down, arrows/`hjkl` focus, `HJKL` resize, `z` zoom, `x` close pane, `&` close tab, `d` detach, `b` right panel, `[` copy mode, `s` session picker, `,` rename tab; prefix twice sends it to the pane.
 - Detach (`prefix d`) / attach (`oui attach <session>`). Shells survive client exit.
 - Session manager UI: list, rename, kill, switch.
 - **Workspaces**: layout files declaring tabs, panes, profile, cwd, startup command:
@@ -91,13 +91,22 @@ An **isolation test suite** runs each supported tool in two profiles and checks 
 ## UI
 - **Tab bar** (top): profile color + name, session name.
 - **Status bar** (bottom): profile, session, mode, key hints, clock. Segments configurable.
-- **Right panel** (collapsible, `prefix p`): v1 widgets — Connected accounts (login state per tool per profile, one-key login), Sessions, Profiles. v2: plugin widgets.
+- **Right panel** (collapsible, `prefix b`): v1 widgets — Connected accounts (login state per tool per profile, one-key login), Sessions, Profiles. v2: plugin widgets.
 - **Starship**: oUI ships a `custom.oui` module showing the active profile.
 - Scrollback search, copy mode with vi keys.
 - Styling from a theme file; user provides the design.
 
 ## Config
-`~/.oui/config.toml` only (no settings UI in v1): keybindings, theme, status bar segments, panel widgets, default profile.
+`~/.oui/config.toml` only (no settings UI in v1). Every key is optional; an invalid file is reported in the status bar and the defaults are used. Full reference: [docs/config.example.toml](docs/config.example.toml) (`oui config default`, `oui config check`).
+- `[general]`: `default_profile` (used when `oui`/`oui new` get no `-p`; falls back to system with a warning if missing), `shell` (instead of `$SHELL`), `scrollback` (lines per pane), `mouse`.
+- `[keys]`: `prefix` and `bindings` (tmux-like notation, layered over the defaults; `"none"` removes one). Status bar hints are generated from the actual bindings.
+- `theme`: built-in `default`/`nord`/`light`, a file in `~/.oui/themes/`, or a `[theme]` table with `base` + colour overrides. `"profile"` as a colour means the tab's profile colour.
+- `[status]`: `left`/`right` segment lists — `session profile mode hints clock cwd hostname tabs-count` or `{ text = "…" }`.
+- `[panel]`: `visible`, `width`, `widgets`.
+
+The client reads the config when it starts; the daemon reads `shell` and `scrollback` when it starts (`oui kill-server` to reload).
+
+Prompt integration: [docs/starship.md](docs/starship.md).
 
 ## CLI
 ```

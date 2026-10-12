@@ -25,6 +25,9 @@ Inside a tab, log in as usual (`claude` → `/login`, `railway login`, `gh auth 
 | `Ctrl-b x` / `&` | close pane / close tab |
 | `Ctrl-b d` | detach (shells keep running) |
 | `Ctrl-b Ctrl-b` | send a literal Ctrl-b |
+| `Ctrl-b b` / `[` / `s` / `,` | right panel / copy mode / session picker / rename tab (coming soon) |
+
+The prefix and every key above can be changed in the config file.
 
 ```bash
 oui ls                    # list sessions
@@ -34,6 +37,28 @@ oui shell work            # plain shell in a profile, no TUI
 oui run work -- railway whoami
 ```
 
+## Config
+`~/.oui/config.toml` (all keys optional): prefix and key bindings, theme (`default`, `nord`, `light` or your own in `~/.oui/themes/`), status bar segments, right panel, default profile, shell, scrollback.
+```bash
+oui config default        # print the full default config, commented
+oui config check          # validate your config
+```
+See [docs/config.example.toml](docs/config.example.toml) for every option, e.g.:
+```toml
+theme = "nord"
+[general]
+default_profile = "work"   # used by `oui` / `oui new` without -p
+[keys]
+prefix = "C-a"
+[keys.bindings]
+v = "split-right"
+[status]
+left = ["mode", "session", "profile"]
+right = ["hints", "clock"]
+```
+Show the active profile in your prompt: [docs/starship.md](docs/starship.md).
+
+## Profiles
 Shared profiles link your non-credential dotfiles (shell config, prompt, toolchains). Add more per profile in `~/.oui/profiles/<name>/profile.toml`:
 ```toml
 extra_shared = [".config/foo", ".mytool/config"]

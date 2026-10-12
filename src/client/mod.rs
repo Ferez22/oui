@@ -5,6 +5,7 @@
 mod input;
 mod render;
 
+use crate::config::Config;
 use crate::profile;
 use crate::protocol::{ClientMsg, Layout, ServerMsg, read_msg, socket_path, write_msg};
 use anyhow::{Context, Result, bail};
@@ -86,6 +87,9 @@ struct App {
     screens: HashMap<u32, vt100::Parser>,
     input: Input,
     flash: Option<String>,
+    config: Config,
+    /// Status bar `hostname` segment (looked up once).
+    hostname: String,
 }
 
 fn picker_options() -> Vec<(String, String)> {
@@ -98,6 +102,21 @@ pub async fn run(session: Option<String>, create: bool, profile: Option<String>)
     if std::env::var_os("OUI_SESSION").is_some() {
         bail!("already inside an oUI session (unset OUI_SESSION to nest anyway)");
     }
+    let (config, mut flash) = Config::load_or_default();
+    // No -p: use general.default_profile, falling back to system if it's gone.
+    let profile = match profile {
+        Some(p) => Some(p),
+        None => match config.general.default_profile.clone() {
+            Some(d) if d != profile::SYSTEM => match profile::load(&d) {
+                Ok(_) => Some(d),
+                Err(e) => {
+                    flash = Some(format!("general.default_profile: {e:#}; using {}", profile::SYSTEM));
+                    None
+                }
+            },
+            _ => None,
+        },
+    };
     let profile = profile.filter(|p| p != profile::SYSTEM);
     if let Some(p) = &profile {
         profile::load(p)?;
@@ -140,7 +159,11 @@ pub async fn run(session: Option<String>, create: bool, profile: Option<String>)
     terminal::enable_raw_mode()?;
     execute!(std::io::stdout(), terminal::EnterAlternateScreen)?;
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
-    let mut app = App { layout: None, screens: HashMap::new(), input: Input::new(cwd.clone()), flash: None };
+    let input = Input::new(cwd.clone(), config.keys.clone(), config.general.default_profile.clone());
+    let hostname = render::hostname();
+    let mut app = App { layout: None, screens: HashMap::new(), input, flash, config, hostname };
+    // Redraw at least every second so the clock segment stays current.
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
 
     let reason = loop {
         tokio::select! {
@@ -156,7 +179,11 @@ pub async fn run(session: Option<String>, create: bool, profile: Option<String>)
                 for msg in app.input.feed(&bytes) {
                     write_msg(&mut wr, &msg).await?;
                 }
+                if let Some(f) = app.input.flash.take() {
+                    app.flash = Some(f);
+                }
             }
+            _ = tick.tick() => {}
             _ = winch.recv() => {
                 let (cols, rows) = terminal::size()?;
                 write_msg(&mut wr, &ClientMsg::Resize { rows: rows.saturating_sub(CHROME_ROWS), cols }).await?;

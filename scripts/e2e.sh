@@ -88,4 +88,53 @@ wait_for 'detached from session' "detach"
 if ! "$bin" ls | grep -q '^demo: 1 tab'; then echo "FAIL session survives detach" >&2; exit 1; fi
 echo "ok   session survives detach"
 
+# --- Custom config: prefix, a remapped key, theme, status segments, general.
+"$bin" kill-server >/dev/null # the daemon reads the config at startup
+"$bin" profile new cfgp --fresh --color magenta >/dev/null
+printf "PS1='$ '\n" >"$OUI_HOME/profiles/cfgp/home/.bash_profile"
+export BASH_SILENCE_DEPRECATION_WARNING=1
+cat >"$OUI_HOME/config.toml" <<'TOML'
+theme = "light"
+[general]
+default_profile = "cfgp"
+shell = "/bin/bash"
+[keys]
+prefix = "C-a"
+[keys.bindings]
+v = "split-right"
+"%" = "none"
+"|" = "none"
+[status]
+left = ["mode", "profile", { text = " <cfg> " }, "tabs-count"]
+right = ["hints"]
+TOML
+"$bin" config check >/dev/null
+
+t kill-session -t t
+t new -d -s c -x 120 -y 30 "'$bin' new -s cfg; sleep 60"
+wait_for 'oUI +1 cfgp' "no -p: first tab uses general.default_profile"
+wait_for '● cfgp │ <cfg> │ 1 tab ' "custom status segments"
+wait_for '\^a c tab · v/" split' "hints show the remapped prefix and split key"
+if ! t capture-pane -p -e | grep -q '48;2;221;221;221'; then
+    echo "FAIL light theme status bar colour" >&2; t capture-pane -p -e | tail -1 | od -c | head >&2; exit 1
+fi
+echo "ok   light theme status bar colour"
+wait_for '^\$' "shell prompt"
+t send-keys 'echo SH=$0' Enter
+wait_for '^SH=/bin/bash' "general.shell overrides \$SHELL"
+t send-keys C-a v
+wait_for '│\$' "remapped split key (prefix C-a v)"
+t send-keys C-a b
+wait_for 'toggle-panel: not available yet' "unimplemented action flashes"
+t send-keys C-a d
+wait_for 'detached from session' "detach with C-a d"
+
+sed -i.bak 's/^default_profile = .*/default_profile = "ghost"/' "$OUI_HOME/config.toml"
+t kill-session -t c
+t new -d -s g -x 160 -y 30 "'$bin' new -s ghost; sleep 60"
+wait_for 'oUI +1 system' "missing default_profile falls back to system"
+wait_for "default_profile: profile 'ghost' not found" "and warns in the status bar"
+t send-keys C-a d
+wait_for 'detached from session' "detach"
+
 echo "all e2e checks passed (temp dirs: $dir $sockdir)"
