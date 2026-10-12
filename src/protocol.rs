@@ -1,6 +1,7 @@
 //! Client ⇄ daemon messages over a unix socket: u32 length prefix + postcard.
 
 use crate::layout::{Dir, Rect};
+use crate::workspace::WorkspaceSpec;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::PathBuf;
@@ -41,6 +42,12 @@ pub enum ClientMsg {
     ListSessions,
     KillSession(String),
     KillServer,
+    /// Create the workspace's session (unless one with its name is running),
+    /// then attach like `Attach`.
+    OpenWorkspace { spec: WorkspaceSpec, rows: u16, cols: u16 },
+    /// Reply with `ServerMsg::Workspace`: the session's tabs, profiles,
+    /// split tree and each shell's current directory.
+    DescribeSession(String),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -85,6 +92,7 @@ pub enum ServerMsg {
     /// Client should exit (detached, session ended, server killed).
     Exit(String),
     Ok,
+    Workspace(WorkspaceSpec),
 }
 
 pub async fn write_msg<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> Result<()> {

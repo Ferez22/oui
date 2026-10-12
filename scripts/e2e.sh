@@ -88,4 +88,71 @@ wait_for 'detached from session' "detach"
 if ! "$bin" ls | grep -q '^demo: 1 tab'; then echo "FAIL session survives detach" >&2; exit 1; fi
 echo "ok   session survives detach"
 
+# ---- workspaces ----
+fail() { echo "FAIL $1" >&2; exit 1; }
+mkdir -p "$OUI_HOME/workspaces" "$dir/proj"
+cat >"$OUI_HOME/workspaces/proj.toml" <<EOF
+name = "proj"
+cwd = "$dir/proj"
+[[tab]]
+profile = "work"
+layout = { split = "right", ratio = 0.6, panes = [
+  { cmd = "echo PANE-A" },
+  { split = "down", panes = [
+    { cmd = "echo PANE-B" },
+    { cmd = "echo PANE-C" },
+  ] },
+] }
+[[tab]]
+profile = "personal"
+layout = { cmd = "echo TAB-TWO" }
+EOF
+
+printf '[[tab]]\nprofile = "nobody"\n' >"$dir/bad.toml"
+if out=$("$bin" open "$dir/bad.toml" 2>&1); then fail "invalid workspace is rejected"; fi
+echo "$out" | grep -q "bad.toml:2: profile 'nobody' not found" || fail "error names file and line: $out"
+echo "ok   invalid workspace is rejected with file:line"
+
+"$bin" workspace list | grep -qE '^proj +2 tab\(s\), 4 pane\(s\) +\[work, personal\]' || fail "workspace list"
+echo "ok   workspace list"
+
+t new-window "'$bin' open proj; sleep 60"
+wait_for '1 work +2 personal' "workspace opens with two tabs"
+wait_for '^PANE-A' "pane 1 runs its command"
+wait_for '│PANE-B' "pane 2 runs its command"
+wait_for '│PANE-C' "pane 3 runs its command"
+wait_for '├─' "panes are split right, then down"
+t send-keys C-b 2
+wait_for '^TAB-TWO' "second tab runs its command in its own profile"
+t send-keys 'echo MARK-$((6*7)) $OUI_PROFILE' Enter
+wait_for '^MARK-42 personal' "second tab runs in profile 'personal'"
+t send-keys C-b d
+wait_for 'detached from session' "detach from workspace"
+
+t new-window "'$bin' open proj; sleep 60"
+wait_for '^MARK-42 personal' "opening again attaches to the running session"
+[ "$("$bin" ls | grep -c '^proj:')" = 1 ] || fail "no duplicate session"
+"$bin" ls | grep -q '^proj: 2 tab' || fail "session keeps its 2 tabs"
+echo "ok   no duplicate session"
+
+"$bin" workspace save proj saved >/dev/null
+saved=$OUI_HOME/workspaces/saved.toml
+grep -q '^name = "saved"' "$saved" || fail "saved name"
+grep -q '^profile = "work"' "$saved" && grep -q '^profile = "personal"' "$saved" || fail "saved profiles"
+grep -q 'split = "right", ratio = 0.6' "$saved" && grep -q 'split = "down"' "$saved" || fail "saved split tree: $(cat "$saved")"
+grep -q "proj\"" "$saved" || fail "saved cwd: $(cat "$saved")"
+if "$bin" workspace save proj saved 2>/dev/null; then fail "save refuses to overwrite"; fi
+echo "ok   workspace save writes profiles, splits and cwd"
+
+t send-keys C-b d
+wait_for 'detached from session' "detach again"
+"$bin" kill proj >/dev/null
+t new-window "'$bin' open saved; sleep 60"
+wait_for '1 work +2 personal' "saved workspace reopens with both tabs"
+wait_for '├─' "saved workspace restores the split tree"
+"$bin" ls | grep -q '^saved: 2 tab' || fail "saved session has 2 tabs"
+echo "ok   workspace save round-trips"
+t send-keys C-b d
+wait_for 'detached from session' "detach from saved workspace"
+
 echo "all e2e checks passed (temp dirs: $dir $sockdir)"

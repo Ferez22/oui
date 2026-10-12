@@ -9,6 +9,7 @@
 use crate::layout::{Axis, Node, Rect, neighbor};
 use crate::profile;
 use crate::protocol::{ClientMsg, Layout, PaneInfo, ServerMsg, SessionInfo, TabInfo, read_msg, socket_path, write_msg};
+use crate::workspace::{PaneSpec, TabSpec, WorkspaceSpec};
 use anyhow::{Context, Result, anyhow, bail};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::HashMap;
@@ -221,11 +222,17 @@ impl State {
                         return Err(e);
                     }
                 }
-                self.clock += 1;
-                let clock = self.clock;
-                self.session_mut(&name)?.last_used = clock;
-                self.clients.insert(id, Client { session: name.clone(), tx: tx.clone() });
-                self.resize(&name, rows, cols)?;
+                self.attach(id, &name, rows, cols, tx)?;
+            }
+            ClientMsg::OpenWorkspace { spec, rows, cols } => {
+                if !self.sessions.iter().any(|s| s.name == spec.name) {
+                    self.create_workspace(&spec, rows, cols)?;
+                }
+                self.attach(id, &spec.name, rows, cols, tx)?;
+            }
+            ClientMsg::DescribeSession(name) => {
+                let spec = self.describe(&name)?;
+                tx.send(ServerMsg::Workspace(spec))?;
             }
             ClientMsg::Input(data) => {
                 let pane = self.focused_pane(id)?;
@@ -371,6 +378,82 @@ impl State {
         s.tabs.push(Tab { profile: profile.map(Into::into), color, root: Node::Leaf(id), focused: id, zoomed: false });
         s.active = s.tabs.len() - 1;
         Ok(id)
+    }
+
+    fn attach(&mut self, client: u64, name: &str, rows: u16, cols: u16, tx: &UnboundedSender<ServerMsg>) -> Result<()> {
+        self.clock += 1;
+        let clock = self.clock;
+        self.session_mut(name)?.last_used = clock;
+        self.clients.insert(client, Client { session: name.into(), tx: tx.clone() });
+        self.resize(name, rows, cols)
+    }
+
+    /// Create a session from a workspace: every tab's pane tree, each pane's
+    /// startup command typed into its shell. Nothing is left behind on error.
+    fn create_workspace(&mut self, spec: &WorkspaceSpec, rows: u16, cols: u16) -> Result<()> {
+        if spec.tabs.is_empty() {
+            bail!("workspace '{}' has no tabs", spec.name);
+        }
+        let name = spec.name.clone();
+        self.sessions.push(Session { name: name.clone(), tabs: vec![], active: 0, rows, cols, last_used: 0 });
+        let mut spawned = Vec::new();
+        let mut result = Ok(());
+        for tab in &spec.tabs {
+            result = self.build_tab(&name, tab, rows, cols, &mut spawned);
+            if result.is_err() {
+                break;
+            }
+        }
+        if let Err(e) = result {
+            self.sessions.retain(|s| s.name != name);
+            for pane in spawned {
+                self.kill_pane(pane);
+            }
+            return Err(e);
+        }
+        self.session_mut(&name)?.active = 0;
+        Ok(())
+    }
+
+    fn build_tab(&mut self, session: &str, tab: &TabSpec, rows: u16, cols: u16, spawned: &mut Vec<u32>) -> Result<()> {
+        let profile = tab.profile.as_deref();
+        let mut color = String::new();
+        // Panes start at the full size; `attach` → `resize` fits them to their rects.
+        let root = Node::build(&tab.layout, &mut |p: &PaneSpec| -> Result<u32> {
+            let (id, c) = self.spawn_pane(session, profile, &p.cwd, rows, cols)?;
+            spawned.push(id);
+            color = c;
+            if let Some(cmd) = &p.cmd {
+                // Typed into the shell: it runs once the shell reads its input,
+                // and the shell (with history) remains when it exits.
+                let pane = self.panes.get_mut(&id).ok_or_else(|| anyhow!("pane gone"))?;
+                pane.writer.write_all(format!("{cmd}\n").as_bytes())?;
+                pane.writer.flush()?;
+            }
+            Ok(id)
+        })?;
+        let focused = root.leaves()[0];
+        let s = self.session_mut(session)?;
+        s.tabs.push(Tab { profile: profile.map(Into::into), color, root, focused, zoomed: false });
+        Ok(())
+    }
+
+    /// A running session as a workspace (commands aren't known, so none).
+    fn describe(&self, name: &str) -> Result<WorkspaceSpec> {
+        let s = self.sessions.iter().find(|s| s.name == name).ok_or_else(|| anyhow!("no session named '{name}'"))?;
+        let panes = &self.panes;
+        let tabs = s
+            .tabs
+            .iter()
+            .map(|t| TabSpec {
+                profile: t.profile.clone(),
+                layout: t.root.to_tree(&mut |id| PaneSpec {
+                    cwd: panes.get(&id).and_then(|p| p.child.process_id()).and_then(pid_cwd).unwrap_or_default(),
+                    cmd: None,
+                }),
+            })
+            .collect();
+        Ok(WorkspaceSpec { name: name.into(), tabs })
     }
 
     /// Split the focused pane of the client's active tab. The new shell runs in

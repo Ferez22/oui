@@ -7,6 +7,7 @@ mod render;
 
 use crate::profile;
 use crate::protocol::{ClientMsg, Layout, ServerMsg, read_msg, socket_path, write_msg};
+use crate::workspace::WorkspaceSpec;
 use anyhow::{Context, Result, bail};
 use input::{Input, Mode};
 use ratatui::Terminal;
@@ -103,19 +104,26 @@ pub async fn run(session: Option<String>, create: bool, profile: Option<String>)
         profile::load(p)?;
     }
     let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+    let attach_cwd = cwd.clone();
+    attach(cwd, move |rows, cols| ClientMsg::Attach { session, create, profile, cwd: attach_cwd, rows, cols }).await
+}
+
+/// Open a parsed workspace: create its session (unless running), then attach.
+pub async fn open_workspace(spec: WorkspaceSpec) -> Result<()> {
+    if std::env::var_os("OUI_SESSION").is_some() {
+        bail!("already inside an oUI session (unset OUI_SESSION to nest anyway)");
+    }
+    let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+    attach(cwd, move |rows, cols| ClientMsg::OpenWorkspace { spec, rows, cols }).await
+}
+
+/// Connect, send `first(rows, cols)` (an attach request), then run the TUI.
+async fn attach(cwd: String, first: impl FnOnce(u16, u16) -> ClientMsg) -> Result<()> {
     let stream = connect(true).await?;
     let (mut rd, mut wr) = stream.into_split();
 
     let (cols, rows) = terminal::size()?;
-    write_msg(&mut wr, &ClientMsg::Attach {
-        session,
-        create,
-        profile,
-        cwd: cwd.clone(),
-        rows: rows.saturating_sub(CHROME_ROWS),
-        cols,
-    })
-    .await?;
+    write_msg(&mut wr, &first(rows.saturating_sub(CHROME_ROWS), cols)).await?;
 
     let (srv_tx, mut srv_rx) = unbounded_channel::<ServerMsg>();
     tokio::spawn(async move {

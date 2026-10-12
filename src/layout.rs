@@ -25,7 +25,7 @@ impl Dir {
 }
 
 /// `Horizontal`: children side by side (split right). `Vertical`: stacked (split down).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Axis {
     Horizontal,
     Vertical,
@@ -52,7 +52,49 @@ pub enum Node {
     Split { axis: Axis, ratio: f32, a: Box<Node>, b: Box<Node> },
 }
 
+/// A layout tree carrying data at its leaves instead of pane ids: what a
+/// workspace file describes before its panes exist, or what a running tab
+/// looks like when it is saved.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum Tree<T> {
+    Leaf(T),
+    Split { axis: Axis, ratio: f32, a: Box<Tree<T>>, b: Box<Tree<T>> },
+}
+
+impl<T> Tree<T> {
+    pub fn leaves(&self) -> Vec<&T> {
+        match self {
+            Tree::Leaf(t) => vec![t],
+            Tree::Split { a, b, .. } => [a.leaves(), b.leaves()].concat(),
+        }
+    }
+}
+
 impl Node {
+    /// Build a pane tree from `tree`, calling `spawn` for each leaf in order
+    /// (left/top first) to get its pane id. Ratios are clamped like `resize`.
+    pub fn build<T, E>(tree: &Tree<T>, spawn: &mut impl FnMut(&T) -> Result<u32, E>) -> Result<Node, E> {
+        Ok(match tree {
+            Tree::Leaf(t) => Node::Leaf(spawn(t)?),
+            Tree::Split { axis, ratio, a, b } => {
+                let a = Node::build(a, spawn)?;
+                let b = Node::build(b, spawn)?;
+                let ratio = if ratio.is_finite() { ratio.clamp(MIN_RATIO, MAX_RATIO) } else { 0.5 };
+                Node::Split { axis: *axis, ratio, a: Box::new(a), b: Box::new(b) }
+            }
+        })
+    }
+
+    /// The tree's shape with `f(pane id)` at each leaf.
+    pub fn to_tree<T>(&self, f: &mut impl FnMut(u32) -> T) -> Tree<T> {
+        match self {
+            Node::Leaf(id) => Tree::Leaf(f(*id)),
+            Node::Split { axis, ratio, a, b } => {
+                Tree::Split { axis: *axis, ratio: *ratio, a: Box::new(a.to_tree(f)), b: Box::new(b.to_tree(f)) }
+            }
+        }
+    }
+
     pub fn leaves(&self) -> Vec<u32> {
         match self {
             Node::Leaf(id) => vec![*id],
@@ -197,6 +239,53 @@ mod tests {
 
     fn area() -> Rect {
         Rect::new(0, 0, 81, 25)
+    }
+
+    #[test]
+    fn build_from_tree_spawns_leaves_in_order() {
+        // a | (b / c)
+        let tree = Tree::Split {
+            axis: Axis::Horizontal,
+            ratio: 0.5,
+            a: Box::new(Tree::Leaf("a")),
+            b: Box::new(Tree::Split {
+                axis: Axis::Vertical,
+                ratio: 2.0, // clamped
+                a: Box::new(Tree::Leaf("b")),
+                b: Box::new(Tree::Leaf("c")),
+            }),
+        };
+        let mut spawned = Vec::new();
+        let node = Node::build(&tree, &mut |s: &&str| -> Result<u32, ()> {
+            spawned.push(*s);
+            Ok(spawned.len() as u32 * 10)
+        })
+        .unwrap();
+        assert_eq!(spawned, ["a", "b", "c"]);
+        assert_eq!(node.leaves(), vec![10, 20, 30]);
+        let Node::Split { b, .. } = &node else { panic!() };
+        assert!(matches!(**b, Node::Split { axis: Axis::Vertical, ratio, .. } if ratio == MAX_RATIO));
+        // Same root geometry as building it with splits.
+        let mut manual = Node::Leaf(10);
+        manual.split(10, 20, Axis::Horizontal);
+        manual.split(20, 30, Axis::Vertical);
+        assert_eq!(node.geometry(area())[0], manual.geometry(area())[0]);
+        // And back to a tree.
+        let back = node.to_tree(&mut |id| id);
+        assert_eq!(back.leaves(), vec![&10, &20, &30]);
+        assert!(matches!(back, Tree::Split { axis: Axis::Horizontal, .. }));
+    }
+
+    #[test]
+    fn build_stops_at_first_error() {
+        let tree = Tree::Split { axis: Axis::Horizontal, ratio: 0.5, a: Box::new(Tree::Leaf(1)), b: Box::new(Tree::Leaf(2)) };
+        let mut calls = 0;
+        let r = Node::build(&tree, &mut |n: &u32| {
+            calls += 1;
+            if *n == 1 { Err("boom") } else { Ok(*n) }
+        });
+        assert_eq!(r, Err("boom"));
+        assert_eq!(calls, 1);
     }
 
     #[test]
