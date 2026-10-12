@@ -115,6 +115,7 @@ An **isolation test suite** runs each supported tool in two profiles and checks 
 
 ## Config
 `~/.oui/config.toml` only (no settings UI in v1). Every key is optional; an invalid file is reported in the status bar and the defaults are used. Full reference: [docs/config.example.toml](docs/config.example.toml) (`oui config default`, `oui config check`).
+- **tmux import**: `oui config import-tmux [path] [--write] [--force]` translates a tmux.conf subset (prefix, prefix-table binds with an oUI action, `unbind`, mouse, history-limit, default-shell) and lists every skipped line; on first launch, if `config.toml` is missing and a tmux config exists, the client offers to import it. See [docs/tmux-import.md](docs/tmux-import.md).
 - `[general]`: `default_profile` (used when `oui`/`oui new` get no `-p`; falls back to system with a warning if missing), `shell` (instead of `$SHELL`), `scrollback` (lines per pane), `mouse` (mouse reporting on the host terminal; see above).
 - `[keys]`: `prefix` and `bindings` (tmux-like notation, layered over the defaults; `"none"` removes one). Status bar hints are generated from the actual bindings.
 - `theme`: built-in `default`/`nord`/`light`, a file in `~/.oui/themes/`, or a `[theme]` table with `base` + colour overrides. `"profile"` as a colour means the tab's profile colour.
