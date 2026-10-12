@@ -68,7 +68,10 @@ Commands are typed into the pane's shell, so the shell stays when they exit. Det
 ```bash
 oui config default        # print the full default config, commented
 oui config check          # validate your config
+oui config import-tmux    # translate ~/.tmux.conf (prefix, binds, mouse, history) — prints it
+oui config import-tmux --write   # …and save it as ~/.oui/config.toml (--force to replace)
 ```
+Coming from tmux? `import-tmux` carries over your prefix, key bindings for splits/panes/windows, `unbind`s, `mouse`, `history-limit` and `default-shell`, and lists every line it couldn't translate (plugins, styling, `run`, copy-mode tables, root `-n` keys). Details: [docs/tmux-import.md](docs/tmux-import.md).
 See [docs/config.example.toml](docs/config.example.toml) for every option, e.g.:
 ```toml
 theme = "nord"
