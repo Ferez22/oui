@@ -1,6 +1,7 @@
 //! oUI: terminal workspace with per-profile isolated logins and tmux-style sessions.
 
 mod client;
+mod config;
 mod daemon;
 mod profile;
 mod protocol;
@@ -51,9 +52,22 @@ enum Cmd {
     },
     /// Print the environment a profile's shells get
     Env { name: String },
+    /// Config file (~/.oui/config.toml)
+    #[command(subcommand)]
+    Config(ConfigCmd),
     /// Run the server (started automatically)
     #[command(hide = true)]
     Daemon,
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Print the config file path
+    Path,
+    /// Print the default config, commented
+    Default,
+    /// Check the config file for errors
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -99,6 +113,19 @@ fn main() -> Result<()> {
         Some(Cmd::Kill { session }) => rt()?.block_on(client::request(ClientMsg::KillSession(session))),
         Some(Cmd::KillServer) => rt()?.block_on(client::request(ClientMsg::KillServer)),
         Some(Cmd::Daemon) => daemon::run(),
+        Some(Cmd::Config(ConfigCmd::Path)) => {
+            println!("{}", config::path()?.display());
+            Ok(())
+        }
+        Some(Cmd::Config(ConfigCmd::Default)) => {
+            print!("{}", config::default_toml());
+            Ok(())
+        }
+        Some(Cmd::Config(ConfigCmd::Check)) => {
+            config::Config::load()?;
+            println!("{}: ok", config::path()?.display());
+            Ok(())
+        }
         Some(Cmd::Profile(ProfileCmd::New { name, fresh, color })) => {
             let dir = profile::create(&name, &color, fresh)?;
             println!("created profile '{name}' at {} (shared dotfiles: {})", dir.display(), !fresh);
