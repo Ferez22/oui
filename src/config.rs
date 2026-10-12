@@ -1,4 +1,5 @@
-//! User config: `~/.oui/config.toml` (keys, theme, status bar, panel, general).
+//! User config: `~/.oui/config.toml` (keys, theme, status bar, panel,
+//! clipboard, general).
 //!
 //! Every section and key is optional; anything missing takes its default.
 //! Parse errors carry the TOML line/column so they can be shown as-is.
@@ -29,6 +30,7 @@ pub struct Config {
     pub theme: Theme,
     pub status: Status,
     pub panel: Panel,
+    pub clipboard: Clipboard,
 }
 
 #[derive(Deserialize, Default)]
@@ -39,6 +41,7 @@ struct RawConfig {
     theme: ThemeSpec,
     status: Status,
     panel: Panel,
+    clipboard: Clipboard,
 }
 
 impl Default for Config {
@@ -49,6 +52,7 @@ impl Default for Config {
             theme: Theme::builtin("default").expect("built-in default theme"),
             status: Status::default(),
             panel: Panel::default(),
+            clipboard: Clipboard::default(),
         }
     }
 }
@@ -82,6 +86,7 @@ impl Config {
             theme: raw.theme.resolve(themes_dir)?,
             status: raw.status,
             panel: raw.panel,
+            clipboard: raw.clipboard,
         })
     }
 }
@@ -810,6 +815,41 @@ impl Default for Panel {
 }
 
 // ---------------------------------------------------------------------------
+// [clipboard]
+
+/// What happens when a program in a pane sets the clipboard (OSC 52).
+/// Copies the user makes (copy mode, mouse drag) always go to the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppClipboard {
+    /// Pass the write on to the host terminal as OSC 52; its own clipboard
+    /// setting decides (like tmux `set-clipboard on`).
+    #[default]
+    Osc52,
+    /// Ignore it.
+    Off,
+    /// OSC 52 and also `pbcopy` / `wl-copy` / `xclip`: works even where the
+    /// host terminal refuses OSC 52, so any program can replace the clipboard.
+    System,
+}
+
+impl AppClipboard {
+    fn name(self) -> &'static str {
+        match self {
+            AppClipboard::Osc52 => "osc52",
+            AppClipboard::Off => "off",
+            AppClipboard::System => "system",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Clipboard {
+    pub apps: AppClipboard,
+}
+
+// ---------------------------------------------------------------------------
 // Default config text
 
 fn toml_str(s: &str) -> String {
@@ -884,7 +924,19 @@ pub fn default_toml() -> String {
     let _ = writeln!(w, "[panel]");
     let _ = writeln!(w, "visible = {}", p.visible);
     let _ = writeln!(w, "width = {}", p.width);
-    let _ = writeln!(w, "widgets = {}", list(p.widgets.iter().map(|x| toml_str(x.name())).collect()));
+    let _ = writeln!(w, "widgets = {}\n", list(p.widgets.iter().map(|x| toml_str(x.name())).collect()));
+
+    let _ = writeln!(w, "# Clipboard writes from programs in panes (OSC 52: vim, ssh, tmux inside oUI).");
+    let _ = writeln!(w, "# Only the focused pane of the active tab may set it, at most every 100 ms.");
+    let _ = writeln!(w, "#   \"osc52\"   pass them on to your terminal as OSC 52; its own setting decides");
+    let _ = writeln!(w, "#             (iTerm2: \"Applications in terminal may access clipboard\").");
+    let _ = writeln!(w, "#   \"off\"     ignore them.");
+    let _ = writeln!(w, "#   \"system\"  also write with pbcopy / wl-copy / xclip. Risky: any program or");
+    let _ = writeln!(w, "#             file shown in the pane (ssh host, cat, curl) can then replace your");
+    let _ = writeln!(w, "#             clipboard, even if your terminal blocks OSC 52.");
+    let _ = writeln!(w, "# Your own copies (copy mode, mouse selection) always reach the clipboard.");
+    let _ = writeln!(w, "[clipboard]");
+    let _ = writeln!(w, "apps = {}", toml_str(c.clipboard.apps.name()));
     s
 }
 
@@ -912,6 +964,7 @@ mod tests {
         assert!(c.general.mouse);
         assert_eq!(c.panel.width, 40);
         assert_eq!(c.panel.widgets.len(), 3);
+        assert_eq!(c.clipboard.apps, AppClipboard::Osc52);
         assert_eq!(c.keys, Keys::default());
     }
 
@@ -1042,5 +1095,16 @@ mod tests {
         assert!(e.contains("prefix"), "{e}");
         let e = err("[panel\nvisible = true");
         assert!(e.contains("line 1"), "{e}");
+        let e = err("[clipboard]\napps = \"always\"");
+        assert!(e.contains("always") && e.contains("osc52"), "{e}");
+    }
+
+    #[test]
+    fn clipboard_modes() {
+        for (text, want) in [("osc52", AppClipboard::Osc52), ("off", AppClipboard::Off), ("system", AppClipboard::System)] {
+            let c = Config::parse(&format!("[clipboard]\napps = \"{text}\""), None).unwrap();
+            assert_eq!(c.clipboard.apps, want);
+            assert_eq!(want.name(), text);
+        }
     }
 }

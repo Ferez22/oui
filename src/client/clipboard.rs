@@ -1,16 +1,31 @@
-//! Host clipboard: OSC 52 to the host terminal (works over ssh) plus the
-//! platform tool when present (`pbcopy`, `wl-copy`, `xclip`).
+//! Host clipboard.
 //!
-//! `OUI_CLIPBOARD_FILE` (tests): copied text is also written to that file and
-//! the platform tools are never run.
+//! The user's own copies (copy mode, mouse selection) go out as OSC 52 to the
+//! host terminal (works over ssh) and through the platform tool when present
+//! (`pbcopy`, `wl-copy`, `xclip`).
+//!
+//! Writes from programs in panes (OSC 52 in pane output) follow
+//! `clipboard.apps`: by default they are only passed on as OSC 52, so the host
+//! terminal's own clipboard permission decides; the platform tool is used only
+//! with `apps = "system"`. The app checks they come from the focused pane of
+//! the active tab and coalesces bursts (`AppClips`).
+//!
+//! `OUI_CLIPBOARD_FILE` (tests): stands in for the platform tool: text that
+//! would go to it is written to that file instead, and the tools never run.
 
+use crate::config::AppClipboard;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Largest text sent with OSC 52; many terminals drop bigger payloads.
 pub const OSC52_MAX_TEXT: usize = 100 * 1024;
+/// Largest OSC 52 payload (base64) taken from a pane (~100 KB of text).
+pub const OSC52_MAX_B64: usize = 140 * 1024;
+/// At most one app clipboard write per this interval; the last one wins.
+pub const APP_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Copy `text`. Returns a status-bar message.
+/// Copy `text` for the user. Returns a status-bar message.
 pub fn copy(text: &[u8]) -> String {
     let osc = text.len() <= OSC52_MAX_TEXT;
     if osc {
@@ -27,10 +42,70 @@ pub fn copy(text: &[u8]) -> String {
     }
 }
 
-/// An app in a pane set the clipboard with OSC 52 (`b64` as it sent it).
-pub fn copy_from_app(b64: &[u8]) {
-    if let Some(text) = base64_decode(b64) {
-        copy(&text);
+/// A program in the focused pane set the clipboard (decoded text).
+pub fn copy_from_app(text: &[u8], mode: AppClipboard) {
+    match mode {
+        AppClipboard::Off => {}
+        AppClipboard::Osc52 if text.len() <= OSC52_MAX_TEXT => write_osc52(&base64_encode(text)),
+        AppClipboard::Osc52 => {}
+        AppClipboard::System => {
+            copy(text);
+        }
+    }
+}
+
+/// vt100 callbacks for the client's pane parsers: collects OSC 52 writes
+/// (base64 as sent). Clipboard reads (`?`) are never answered.
+#[derive(Default)]
+pub struct Catch(pub Vec<Vec<u8>>);
+
+impl vt100::Callbacks for Catch {
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _ty: &[u8], data: &[u8]) {
+        if data != b"?" && data.len() <= OSC52_MAX_B64 {
+            self.0.push(data.to_vec());
+        }
+    }
+}
+
+/// Rate limit for app clipboard writes: the first goes out at once, later
+/// ones at most every `APP_INTERVAL`, keeping only the newest.
+#[derive(Default)]
+pub struct AppClips {
+    last: Option<Instant>,
+    pending: Option<(Vec<u8>, Instant)>,
+}
+
+impl AppClips {
+    /// A new write at `now`: returns the text to copy right away, if any.
+    pub fn offer(&mut self, text: Vec<u8>, now: Instant) -> Option<Vec<u8>> {
+        if let Some((_, due)) = self.pending {
+            self.pending = Some((text, due));
+            return None;
+        }
+        match self.last {
+            Some(t) if now < t + APP_INTERVAL => {
+                self.pending = Some((text, t + APP_INTERVAL));
+                None
+            }
+            _ => {
+                self.last = Some(now);
+                Some(text)
+            }
+        }
+    }
+
+    /// When the held-back write is due.
+    pub fn due(&self) -> Option<Instant> {
+        self.pending.as_ref().map(|(_, t)| *t)
+    }
+
+    /// The held-back write, if it is due at `now`.
+    pub fn take_due(&mut self, now: Instant) -> Option<Vec<u8>> {
+        if self.due().is_some_and(|t| t <= now) {
+            self.last = Some(now);
+            return self.pending.take().map(|(text, _)| text);
+        }
+        None
     }
 }
 
@@ -119,5 +194,35 @@ mod tests {
         let bin: Vec<u8> = (0..=255).collect();
         assert_eq!(base64_decode(base64_encode(&bin).as_bytes()).unwrap(), bin);
         assert!(base64_decode(b"!!").is_none());
+    }
+
+    #[test]
+    fn app_clips_are_rate_limited() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut c = AppClips::default();
+        assert_eq!(c.offer(b"a".to_vec(), t0), Some(b"a".to_vec()));
+        // A burst inside the interval: held back, the newest wins.
+        assert_eq!(c.offer(b"b".to_vec(), ms(10)), None);
+        assert_eq!(c.offer(b"c".to_vec(), ms(20)), None);
+        assert_eq!(c.due(), Some(ms(100)));
+        assert_eq!(c.take_due(ms(50)), None);
+        assert_eq!(c.take_due(ms(100)), Some(b"c".to_vec()));
+        assert_eq!(c.due(), None);
+        // Next one within the interval of that flush waits again.
+        assert_eq!(c.offer(b"d".to_vec(), ms(150)), None);
+        assert_eq!(c.take_due(ms(200)), Some(b"d".to_vec()));
+        // Quiet for a while: immediate.
+        assert_eq!(c.offer(b"e".to_vec(), ms(1000)), Some(b"e".to_vec()));
+    }
+
+    #[test]
+    fn catch_collects_osc52_writes_but_not_reads() {
+        let mut p = vt100::Parser::new_with_callbacks(5, 20, 0, Catch::default());
+        p.process(b"x\x1b]52;c;QVBQ\x07y\x1b]52;c;?\x07");
+        // Split across two outputs.
+        p.process(b"\x1b]52;c;Wl");
+        p.process(b"o=\x1b\\");
+        assert_eq!(p.callbacks().0, [b"QVBQ".to_vec(), b"Wlo=".to_vec()]);
     }
 }

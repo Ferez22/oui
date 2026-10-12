@@ -676,7 +676,7 @@ t send-keys C-b b
 t send-keys C-b D y # detach asks first
 wait_for 'detached from session' "detach"
 
-# Reattached clients get the history from the daemon; apps' OSC 52 is forwarded.
+# Reattached clients get the history from the daemon.
 t kill-session -t m
 t new -d -s r -x 120 -y 30 "OUI_CLIPBOARD_FILE='$clip' '$bin' attach copy; sleep 60"
 wait_for '^CLICK-42' "reattach"
@@ -684,8 +684,83 @@ raw '\e[<0;5;5M\e[<0;5;5m'
 t send-keys C-b [ g
 wait_for '^1 +│' "history from the daemon after reattach"
 t send-keys q
-t send-keys "printf '\\033]52;c;%s\\007' \$(printf APPCLIP | base64)" Enter
-clip_is "APPCLIP" "OSC 52 from an app in a pane reaches the clipboard"
+
+# Apps' OSC 52 (default clipboard.apps = "osc52"): the focused pane's writes
+# go to the host terminal as OSC 52 only, never to the platform tool (the
+# hook file keeps the last copy the user made).
+# buffer_is <text> <what>: the host tmux's newest paste buffer is <text>.
+buffer_is() {
+    for _ in $(seq 50); do
+        if [ "$(t show-buffer 2>/dev/null)" = "$1" ]; then echo "ok   $2"; return; fi
+        sleep 0.1
+    done
+    echo "FAIL $2 (host buffer: $(t show-buffer 2>/dev/null))" >&2; exit 1
+}
+osc52() { printf "printf '\\\\033]52;c;%%s\\\\007' \$(printf %s | base64)" "$1"; }
+t send-keys "$(osc52 APPCLIP)" Enter
+buffer_is APPCLIP "OSC 52 from the focused pane reaches the host terminal as OSC 52"
+sleep 0.3
+clip_is "DRAGME" "... but not the platform clipboard tool (apps = osc52)"
+t send-keys C-b l # right pane: write in 1 s, after focus moved back left
+t send-keys "sleep 1; $(osc52 BGCLIP)" Enter
+t send-keys C-b h
+sleep 2
+buffer_is APPCLIP "OSC 52 from a pane that isn't focused is ignored"
+t send-keys "for x in R1 R2 R3; do $(osc52 '$x'); done" Enter
+buffer_is R3 "a burst of app clipboard writes ends with the newest"
+
+# Bracketed paste. tmux's paste-buffer -p brackets only for an app (oUI) that
+# turned bracketed paste on, so these also check that oUI did.
+# paste <text>: paste <text> into the host terminal.
+paste() { t set-buffer -b oui-paste -- "$1"; t paste-buffer -p -d -b oui-paste; }
+t send-keys 'clear; cat -v' Enter
+sleep 0.3
+paste "$(printf 'P\002%%Q')"
+t send-keys Enter
+wait_for '^P\^B%Q +│' "pasted prefix + % reaches the pane as text (no brackets: pane didn't ask)"
+if screen | sed '1d;$d' | grep -q '│.*│'; then echo "FAIL pasted prefix + % splits" >&2; screen >&2; exit 1; fi
+echo "ok   pasted prefix + % doesn't split"
+t send-keys C-c
+t send-keys "clear; printf '\\033[?2004h'; cat -v" Enter
+sleep 0.3
+paste BR
+t send-keys Enter
+wait_for '^\^\[\[200~BR\^\[\[201~ +│' "a pane that asked for bracketed paste gets it bracketed"
+t send-keys C-c
+t send-keys "printf '\\033[?2004l'; clear" Enter
+t send-keys C-b D
+wait_for 'Detach from oUI' "detach asks"
+paste y
+sleep 0.5
+if screen | grep -q 'detached from session'; then echo "FAIL a pasted y answers the question" >&2; exit 1; fi
+wait_for 'Detach from oUI' "a pasted y doesn't answer the question"
+t send-keys n
+for _ in $(seq 50); do screen | grep -q 'Detach from oUI' || break; sleep 0.1; done
+t send-keys C-b ,
+wait_for ' RENAME ' "rename prompt"
+t send-keys C-u
+paste "$(printf 'past\ned')"
+t send-keys Enter
+wait_for 'oUI +1 pasted · personal' "pasted text goes into the rename prompt (newline dropped)"
+t send-keys C-b [
+wait_for ' COPY ' "copy mode"
+paste q
+sleep 0.5
+wait_for ' COPY ' "a paste is ignored in copy mode (a pasted q doesn't leave it)"
+t send-keys q
+
+# clipboard.apps = "system": the platform tool too (explicit opt-in).
+printf '[clipboard]\napps = "system"\n' >>"$OUI_HOME/config.toml"
+t send-keys C-b D y # detach asks first
+wait_for 'detached from session' "detach"
+paste ZZ
+wait_for 'ZZ' "paste after detach"
+no_leak '200~' "detach turns bracketed paste off in the host terminal"
+t kill-session -t r
+t new -d -s r -x 120 -y 30 "OUI_CLIPBOARD_FILE='$clip' '$bin' attach copy; sleep 60"
+wait_for 'oUI +1 pasted' "reattach"
+t send-keys "$(osc52 SYSCLIP)" Enter
+clip_is "SYSCLIP" "apps = \"system\": OSC 52 from an app also reaches the platform tool"
 t send-keys C-b D y # detach asks first
 wait_for 'detached from session' "detach"
 

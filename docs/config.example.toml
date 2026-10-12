@@ -95,3 +95,15 @@ right = ["hints", "clock"]
 visible = false
 width = 32
 widgets = ["accounts", "sessions", "profiles"]
+
+# Clipboard writes from programs in panes (OSC 52: vim, ssh, tmux inside oUI).
+# Only the focused pane of the active tab may set it, at most every 100 ms.
+#   "osc52"   pass them on to your terminal as OSC 52; its own setting decides
+#             (iTerm2: "Applications in terminal may access clipboard").
+#   "off"     ignore them.
+#   "system"  also write with pbcopy / wl-copy / xclip. Risky: any program or
+#             file shown in the pane (ssh host, cat, curl) can then replace your
+#             clipboard, even if your terminal blocks OSC 52.
+# Your own copies (copy mode, mouse selection) always reach the clipboard.
+[clipboard]
+apps = "osc52"

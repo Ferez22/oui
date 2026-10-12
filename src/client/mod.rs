@@ -38,6 +38,31 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 const CHROME_ROWS: u16 = 2; // tab bar + status bar
 
+/// Host terminal: bracket pastes with `ESC [200~` … `ESC [201~`.
+const PASTE_ON: &str = "\x1b[?2004h";
+const PASTE_OFF: &str = "\x1b[?2004l";
+
+/// The client's copy of a pane's screen; also catches the pane's OSC 52.
+pub type PaneParser = vt100::Parser<clipboard::Catch>;
+
+pub fn new_parser(rows: u16, cols: u16, scrollback: usize) -> PaneParser {
+    vt100::Parser::new_with_callbacks(rows, cols, scrollback, clipboard::Catch::default())
+}
+
+/// Puts the host terminal back (raw mode, mouse, bracketed paste, alternate
+/// screen) however `attach` ends: detach, session end, error or panic.
+struct TermGuard;
+
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+        let mut out = std::io::stdout();
+        let _ = out.write_all(format!("{PASTE_OFF}{}", mouse::DISABLE).as_bytes());
+        let _ = execute!(out, terminal::LeaveAlternateScreen);
+        let _ = std::io::stdout().flush();
+    }
+}
+
 /// Connect to the daemon (starting it if needed) and check it speaks our
 /// protocol. A daemon on another version gives a `ServerMismatch` error.
 pub async fn connect(spawn: bool) -> Result<UnixStream> {
@@ -201,7 +226,7 @@ pub async fn request(msg: ClientMsg) -> Result<()> {
 
 struct App {
     layout: Option<Layout>,
-    screens: HashMap<u32, vt100::Parser>,
+    screens: HashMap<u32, PaneParser>,
     input: Input,
     flash: Option<String>,
     config: Config,
@@ -225,6 +250,10 @@ struct App {
     have_history: HashSet<u32>,
     /// Messages produced while handling server messages, sent by the main loop.
     outbox: Vec<ClientMsg>,
+    /// Clipboard writes from the focused pane, rate limited.
+    app_clips: clipboard::AppClips,
+    /// App clipboard writes to pass on, by the main loop.
+    clip_out: Vec<Vec<u8>>,
 }
 
 enum Overlay {
@@ -363,12 +392,17 @@ async fn attach(
     let mut winch = signal(SignalKind::window_change())?;
 
     terminal::enable_raw_mode()?;
+    let guard = TermGuard;
     execute!(std::io::stdout(), terminal::EnterAlternateScreen)?;
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     let mouse_on = config.general.mouse;
-    if mouse_on {
+    {
+        // Pastes arrive bracketed, so they are never taken for keys.
         let mut out = std::io::stdout();
-        out.write_all(mouse::ENABLE.as_bytes())?;
+        out.write_all(PASTE_ON.as_bytes())?;
+        if mouse_on {
+            out.write_all(mouse::ENABLE.as_bytes())?;
+        }
         out.flush()?;
     }
     let mut input = Input::new(cwd.clone(), config.keys.clone(), config.general.default_profile.clone());
@@ -400,6 +434,8 @@ async fn attach(
         drag_start: (0, 0),
         have_history: HashSet::new(),
         outbox: Vec::new(),
+        app_clips: clipboard::AppClips::default(),
+        clip_out: Vec::new(),
     };
     // Redraw at least every second so the clock segment stays current.
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -415,18 +451,23 @@ async fn attach(
                 if matches!(app.input.mode, Mode::Normal) {
                     app.flash = None;
                 }
-                for msg in app.input.feed(&bytes) {
-                    write_msg(&mut wr, &msg).await?;
-                }
-                for msg in app.on_events() {
-                    write_msg(&mut wr, &msg).await?;
-                }
-                if let Some(f) = app.input.flash.take() {
-                    app.flash = Some(f);
-                }
+                // A paste is re-bracketed only for a pane that asked for it.
+                app.input.bracketed = app.focused_screen().is_some_and(|s| s.bracketed_paste());
+                let msgs = app.input.feed(&bytes);
+                app.after_input(msgs, &mut wr).await?;
+            }
+            // A possible cut-off paste marker never completed: it was keys.
+            _ = repeat_end(app.input.hold_until) => {
+                app.input.bracketed = app.focused_screen().is_some_and(|s| s.bracketed_paste());
+                let msgs = app.input.flush_held();
+                app.after_input(msgs, &mut wr).await?;
             }
             // Repeat window over: redraw so the REPEAT badge goes away.
             _ = repeat_end(app.input.repeat_until) => app.input.repeat_until = None,
+            // A clipboard write held back by the rate limit.
+            _ = repeat_end(app.app_clips.due()) => {
+                app.clip_out.extend(app.app_clips.take_due(std::time::Instant::now()));
+            }
             _ = tick.tick() => {
                 // Keep an open session picker's list current.
                 if matches!(app.overlay, Some(Overlay::Sessions(_))) {
@@ -460,20 +501,19 @@ async fn attach(
         for msg in std::mem::take(&mut app.outbox) {
             write_msg(&mut wr, &msg).await?;
         }
+        for text in std::mem::take(&mut app.clip_out) {
+            clipboard::copy_from_app(&text, app.config.clipboard.apps);
+        }
         term.draw(|f| render::draw(&app, f))?;
     };
 
-    terminal::disable_raw_mode()?;
-    if app.input.mouse {
-        print!("{}", mouse::DISABLE);
-    }
-    execute!(std::io::stdout(), terminal::LeaveAlternateScreen)?;
+    drop(guard);
     println!("{}", goodbye(&reason));
     // The stdin thread is blocked on read; exit instead of joining it.
     std::process::exit(0);
 }
 
-/// Resolves when the repeat window `until` closes (never if there's none).
+/// Resolves at `until` (never if there's none).
 async fn repeat_end(until: Option<std::time::Instant>) {
     match until {
         Some(t) => tokio::time::sleep_until(tokio::time::Instant::from_std(t)).await,
@@ -482,6 +522,20 @@ async fn repeat_end(until: Option<std::time::Instant>) {
 }
 
 impl App {
+    /// Send what the last input produced, then the client-side events it queued.
+    async fn after_input(&mut self, msgs: Vec<ClientMsg>, wr: &mut tokio::net::unix::OwnedWriteHalf) -> Result<()> {
+        for msg in msgs {
+            write_msg(wr, &msg).await?;
+        }
+        for msg in self.on_events() {
+            write_msg(wr, &msg).await?;
+        }
+        if let Some(f) = self.input.flash.take() {
+            self.flash = Some(f);
+        }
+        Ok(())
+    }
+
     fn on_server(&mut self, msg: ServerMsg) {
         match msg {
             ServerMsg::Layout(l) => {
@@ -490,9 +544,9 @@ impl App {
             }
             ServerMsg::Snapshot { pane, rows, cols, data } => {
                 // Keep scrollback locally too, so history grows with output.
-                let mut p = vt100::Parser::new(rows, cols, self.config.general.scrollback);
+                let mut p = new_parser(rows, cols, self.config.general.scrollback);
                 if crate::vt::process(&mut p, &data).is_err() {
-                    p = vt100::Parser::new(rows, cols, self.config.general.scrollback);
+                    p = new_parser(rows, cols, self.config.general.scrollback);
                     self.flash = Some(format!("pane {pane}: display reset after a terminal emulator error"));
                 }
                 self.screens.insert(pane, p);
@@ -504,9 +558,9 @@ impl App {
             }
             ServerMsg::History { pane, rows, cols, history, data } => {
                 let scrollback = self.config.general.scrollback.max(history as usize);
-                let mut p = vt100::Parser::new(rows, cols, scrollback);
+                let mut p = new_parser(rows, cols, scrollback);
                 if crate::vt::process(&mut p, &data).is_err() {
-                    p = vt100::Parser::new(rows, cols, scrollback);
+                    p = new_parser(rows, cols, scrollback);
                     self.flash = Some(format!("pane {pane}: display reset after a terminal emulator error"));
                 }
                 let old = self.screens.insert(pane, p);
@@ -523,11 +577,12 @@ impl App {
                 }
             }
             ServerMsg::Output { pane, data } => {
+                let focused = self.focused_pane() == Some(pane);
                 if let Some(p) = self.screens.get_mut(&pane) {
                     if crate::vt::process(p, &data).is_err() {
                         // Start over from the daemon's copy of the screen.
                         let (rows, cols) = p.screen().size();
-                        *p = vt100::Parser::new(rows, cols, self.config.general.scrollback);
+                        *p = new_parser(rows, cols, self.config.general.scrollback);
                         self.outbox.push(ClientMsg::History(pane));
                         self.flash = Some(format!("pane {pane}: display reset after a terminal emulator error"));
                         return;
@@ -535,10 +590,20 @@ impl App {
                     if let Some(c) = self.copy.as_mut().filter(|c| c.pane == pane) {
                         c.sync(p);
                     }
+                    // OSC 52 from the pane: only the focused pane of the
+                    // active tab may set the clipboard.
+                    let clips = std::mem::take(&mut p.callbacks_mut().0);
+                    if focused {
+                        for text in clips.iter().filter_map(|b64| clipboard::base64_decode(b64)) {
+                            self.app_clip(text);
+                        }
+                    }
                 }
             }
             ServerMsg::Sessions(list) => self.panel.sessions = list,
-            ServerMsg::Clipboard(b64) => clipboard::copy_from_app(&b64),
+            // The daemon's copy of a pane's OSC 52 doesn't say which pane it
+            // came from: the client catches it in its own parser instead.
+            ServerMsg::Clipboard(_) => {}
             ServerMsg::Error(e) => self.flash = Some(e),
             ServerMsg::Busy(busy) => {
                 let Some(Overlay::Pending(action)) = self.overlay else { return };
@@ -559,6 +624,23 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// The focused pane of the active tab.
+    fn focused_pane(&self) -> Option<u32> {
+        self.layout.as_ref().and_then(|l| l.tabs.get(l.active)).map(|t| t.focused)
+    }
+
+    fn focused_screen(&self) -> Option<&vt100::Screen> {
+        self.focused_pane().and_then(|p| self.screens.get(&p)).map(|p| p.screen())
+    }
+
+    /// A program in the focused pane set the clipboard.
+    fn app_clip(&mut self, text: Vec<u8>) {
+        if self.config.clipboard.apps == config::AppClipboard::Off {
+            return;
+        }
+        self.clip_out.extend(self.app_clips.offer(text, std::time::Instant::now()));
     }
 
     /// Resize message for the pane area (terminal minus bars and panel).
@@ -631,6 +713,7 @@ impl App {
                     // The overlay closed earlier in this read: the key is the pane's.
                     None => out.push(ClientMsg::Input(k)),
                 },
+                UiEvent::Paste(text) => self.overlay_paste(&text),
             }
         }
         if self.layout.is_some() {
@@ -794,6 +877,16 @@ impl App {
         }
     }
 
+    /// Pasted text while an overlay is open: typed into a name prompt (rename
+    /// tab, new session). Never an answer: confirmations, the tmux import
+    /// offer, the panel and the session list ignore it.
+    fn overlay_paste(&mut self, text: &[u8]) {
+        match &mut self.overlay {
+            Some(Overlay::Rename(p)) | Some(Overlay::Sessions(SessionPicker::NewName(p))) => p.paste(text),
+            _ => {}
+        }
+    }
+
     fn overlay_key(&mut self, key: &[u8], out: &mut Vec<ClientMsg>) {
         match self.overlay.take() {
             Some(Overlay::Panel) => {
@@ -904,8 +997,7 @@ impl App {
         for ev in std::mem::take(&mut self.input.events) {
             match ev {
                 input::Event::EnterCopy => {
-                    let focused = self.layout.as_ref().and_then(|l| l.tabs.get(l.active)).map(|t| t.focused);
-                    match focused {
+                    match self.focused_pane() {
                         Some(pane) => self.enter_copy(pane, false),
                         None => self.input.mode = Mode::Normal,
                     }
@@ -992,5 +1084,105 @@ mod tests {
         .await;
         assert_eq!(mismatch(r), Some(None));
         assert_eq!(&MAGIC, b"oUIp");
+    }
+
+    use crate::layout::Rect;
+    use crate::protocol::{PaneInfo, TabInfo};
+
+    fn tab(panes: &[u32], focused: u32) -> TabInfo {
+        TabInfo {
+            name: None,
+            profile: profile::SYSTEM.into(),
+            color: "gray".into(),
+            panes: panes.iter().map(|&id| PaneInfo { id, rect: Rect::default() }).collect(),
+            focused,
+            zoomed: false,
+        }
+    }
+
+    /// Session "s": tab 0 (panes 1, 2; 1 focused) active, tab 1 (pane 3).
+    fn app() -> App {
+        let (bg, _) = unbounded_channel();
+        let mut app = App {
+            layout: None,
+            screens: HashMap::new(),
+            input: Input::new("/tmp".into(), crate::config::Keys::default(), None),
+            flash: None,
+            config: Config::default(),
+            hostname: String::new(),
+            panel: Panel::new(false),
+            overlay: None,
+            term: (80, 24),
+            cwd: "/tmp".into(),
+            new_session_profile: None,
+            bg,
+            copy: None,
+            drag: None,
+            drag_start: (0, 0),
+            have_history: HashSet::new(),
+            outbox: Vec::new(),
+            app_clips: clipboard::AppClips::default(),
+            clip_out: Vec::new(),
+        };
+        app.on_server(ServerMsg::Layout(Layout { session: "s".into(), tabs: vec![tab(&[1, 2], 1), tab(&[3], 3)], active: 0 }));
+        for pane in [1, 2, 3] {
+            app.on_server(ServerMsg::Snapshot { pane, rows: 5, cols: 20, data: Vec::new() });
+        }
+        app
+    }
+
+    fn osc52(text: &str) -> Vec<u8> {
+        format!("\x1b]52;c;{}\x07", clipboard::base64_encode(text.as_bytes())).into_bytes()
+    }
+
+    #[test]
+    fn only_the_focused_pane_sets_the_clipboard() {
+        let mut app = app();
+        // Background pane, other tab, the daemon's unattributed copy: ignored.
+        app.on_server(ServerMsg::Output { pane: 2, data: osc52("split") });
+        app.on_server(ServerMsg::Output { pane: 3, data: osc52("other tab") });
+        app.on_server(ServerMsg::Clipboard(clipboard::base64_encode(b"daemon").into_bytes()));
+        assert!(app.clip_out.is_empty());
+        app.on_server(ServerMsg::Output { pane: 1, data: osc52("mine") });
+        assert_eq!(app.clip_out, [b"mine".to_vec()]);
+        // A burst right after is held back; the newest goes out when due.
+        app.on_server(ServerMsg::Output { pane: 1, data: [osc52("a"), osc52("b")].concat() });
+        assert_eq!(app.clip_out.len(), 1);
+        let due = app.app_clips.due().expect("held back");
+        assert_eq!(app.app_clips.take_due(due), Some(b"b".to_vec()));
+        // apps = "off": nothing.
+        let mut app = super::tests::app();
+        app.config.clipboard.apps = config::AppClipboard::Off;
+        app.on_server(ServerMsg::Output { pane: 1, data: osc52("mine") });
+        assert!(app.clip_out.is_empty() && app.app_clips.due().is_none());
+    }
+
+    #[test]
+    fn focused_pane_bracketed_paste_mode() {
+        let mut app = app();
+        assert_eq!(app.focused_screen().map(|s| s.bracketed_paste()), Some(false));
+        app.on_server(ServerMsg::Output { pane: 2, data: b"\x1b[?2004h".to_vec() });
+        assert_eq!(app.focused_screen().map(|s| s.bracketed_paste()), Some(false));
+        app.on_server(ServerMsg::Output { pane: 1, data: b"\x1b[?2004h".to_vec() });
+        assert_eq!(app.focused_screen().map(|s| s.bracketed_paste()), Some(true));
+    }
+
+    #[test]
+    fn paste_never_answers_a_question() {
+        let mut app = app();
+        let confirm = || Confirm { title: "t".into(), text: "t".into(), action: Action::ClosePane, offer_detach: true };
+        app.overlay = Some(Overlay::Confirm(confirm()));
+        app.input.mode = Mode::Overlay;
+        app.input.ui.push(UiEvent::Paste(b"y\r".to_vec()));
+        assert!(app.update().is_empty());
+        assert!(matches!(app.overlay, Some(Overlay::Confirm(_))), "still asking");
+        // Typed, `y` does answer.
+        app.input.ui.push(UiEvent::Key(b"y".to_vec()));
+        assert_eq!(app.update().iter().map(|m| format!("{m:?}")).collect::<Vec<_>>(), ["ClosePane"]);
+        // Name prompts take pasted text (without the newline).
+        app.overlay = Some(Overlay::Rename(Prompt::new("rename tab", "a")));
+        app.input.ui.push(UiEvent::Paste(b"b\rc".to_vec()));
+        assert!(app.update().is_empty());
+        assert!(matches!(&app.overlay, Some(Overlay::Rename(p)) if p.text() == "abc"));
     }
 }

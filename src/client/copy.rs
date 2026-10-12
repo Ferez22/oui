@@ -15,7 +15,7 @@ use crate::scrollback::history_len;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use vt100::Parser;
+use super::PaneParser as Parser;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct Pos {
@@ -603,7 +603,7 @@ mod tests {
 
     /// 5×20 pane: lines "line 1".."line 30", then "foo bar_baz qux", "$ ".
     fn fixture() -> Parser {
-        let mut p = Parser::new(5, 20, 1000);
+        let mut p = super::super::new_parser(5, 20, 1000);
         for i in 1..=30 {
             p.process(format!("line {i}\r\n").as_bytes());
         }
@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn wrapped_lines_join_when_copied() {
-        let mut p = Parser::new(5, 10, 100);
+        let mut p = super::super::new_parser(5, 10, 100);
         p.process(b"0123456789abcdef\r\n");
         let mut c = Copy::new(1, &mut p, false);
         c.cursor = Pos { line: 0, col: 0 };

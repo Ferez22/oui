@@ -63,6 +63,12 @@ impl Prompt {
         }
         PromptOutcome::Pending
     }
+
+    /// Pasted text: inserted as typed, without control characters, so a
+    /// pasted newline or Esc never submits or cancels.
+    pub fn paste(&mut self, text: &[u8]) {
+        self.buf.extend(text.iter().filter(|&&b| b >= 0x20 && b != 0x7f));
+    }
 }
 
 /// Session picker: list → (n) name prompt, (x) kill confirmation.
@@ -341,6 +347,9 @@ mod tests {
         p.key(b"\x15");
         assert_eq!(feed(&mut p, b"  \r"), PromptOutcome::Submit(String::new()));
         assert_eq!(p.key(b"\x1b"), PromptOutcome::Cancel);
+        let mut p = Prompt::new("rename tab", "a");
+        p.paste(b"b\r\x1bc\n\x7f\xc3\xa9");
+        assert_eq!(p.text(), "abcé");
     }
 
     #[test]
