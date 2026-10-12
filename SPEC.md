@@ -76,7 +76,7 @@ An **isolation test suite** runs each supported tool in two profiles and checks 
 
 ## Sessions (tmux-style)
 - Hierarchy: **Session → Tabs → Panes**. Each tab runs one profile; tab label shows profile name + color.
-- Prefix key (default `Ctrl-b`), configurable. Default keys after the prefix: `c` new tab, `n`/`p`/`1-9` switch tab, `%`/`|` split right, `"`/`-` split down, arrows/`hjkl` focus, `HJKL` resize, `z` zoom, `x` close pane, `&` close tab, `d` detach, `b` right panel, `[` copy mode, `s` session picker, `,` rename tab; prefix twice sends it to the pane.
+- Prefix key (default `Ctrl-b`), configurable. Default keys after the prefix: `c` new tab, `n`/`p`/`1-9` switch tab, `%`/`|` split right, `"`/`-` split down, arrows/`hjkl` focus, `HJKL` resize, `z` zoom, `x` close pane, `&` close tab, `d` detach, `b` right panel, `Tab` focus the panel, `[` copy mode, `s` session picker, `,` rename tab; prefix twice sends it to the pane.
 - Detach (`prefix d`) / attach (`oui attach <session>`). Shells survive client exit.
 - Session manager UI: list, rename, kill, switch.
 - **Workspaces**: layout files declaring tabs, panes, profile, cwd, startup command:
@@ -89,9 +89,16 @@ An **isolation test suite** runs each supported tool in two profiles and checks 
 - Resurrection after reboot (relaunch commands in saved cwd): v2.
 
 ## UI
-- **Tab bar** (top): profile color + name, session name.
-- **Status bar** (bottom): profile, session, mode, key hints, clock. Segments configurable.
-- **Right panel** (collapsible, `prefix b`): v1 widgets — Connected accounts (login state per tool per profile, one-key login), Sessions, Profiles. v2: plugin widgets.
+- **Tab bar** (top): tab number, optional name (`prefix ,`; shown as `1 name · profile`), profile name in the profile colour — the profile is always visible.
+- **Status bar** (bottom): profile, session, mode, key hints, clock. Segments configurable. The mode badge shows `PREFIX`, `PANEL`, `SESSIONS` or `RENAME`.
+- **Right panel** (collapsible, `prefix b`; initial state `panel.visible`, width `panel.width`): the pane area shrinks by its width and the client reports the smaller size, so shells reflow. Widgets in `panel.widgets` order:
+  - **Accounts** for the active tab's profile: `●` logged in (with the account when known), `○` logged out, `?` can't tell (login may sit in the macOS Keychain — never shown as logged out). Tools that aren't installed and have no login are hidden behind a dim `+N not installed` line. Detection is offline/filesystem-only and runs off the draw path; it refreshes when the panel opens, when the active profile changes, and every 5 s while visible.
+  - **Sessions** with tab counts, current marked `▸`.
+  - **Profiles** with colour dot and shared/fresh.
+  - `prefix Tab` focuses the panel (`j`/`k`/arrows, `Esc`/`q` back). `Enter`: on an account, opens a new tab in the same profile that runs the tool's login command (Claude Code: runs `claude` and tells you to type `/login`; git: shows the `git config` command instead of running it); on a session, switches to it; on a profile, opens a tab in it.
+  - v2: plugin widgets.
+- **Session picker** (`prefix s`): list with tab counts; `Enter` switch, `n` new session (first tab in the default profile), `x` kill with y/n confirmation (killing the current session moves you to another one first).
+- New-tab profile picker, session picker and prompts use the theme's panel colours (`panel_bg`, `panel_fg`, `accent`).
 - **Starship**: oUI ships a `custom.oui` module showing the active profile.
 - Scrollback search, copy mode with vi keys.
 - Styling from a theme file; user provides the design.

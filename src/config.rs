@@ -134,6 +134,8 @@ pub enum Action {
     ResizeDown,
     Zoom,
     TogglePanel,
+    /// Move keyboard focus to the right panel (opening it if hidden).
+    FocusPanel,
     CopyMode,
     /// Reserved (v2).
     CommandPalette,
@@ -162,6 +164,7 @@ const ACTION_NAMES: &[(&str, Action)] = &[
     ("resize-down", Action::ResizeDown),
     ("zoom", Action::Zoom),
     ("toggle-panel", Action::TogglePanel),
+    ("focus-panel", Action::FocusPanel),
     ("copy-mode", Action::CopyMode),
     ("command-palette", Action::CommandPalette),
     ("send-prefix", Action::SendPrefix),
@@ -281,6 +284,7 @@ pub const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("J", "resize-down"),
     ("z", "zoom"),
     ("b", "toggle-panel"),
+    ("Tab", "focus-panel"),
     ("[", "copy-mode"),
     ("s", "session-picker"),
     (",", "rename-tab"),
@@ -850,7 +854,7 @@ pub fn default_toml() -> String {
     let _ = writeln!(w, "# use \"none\" to remove a default binding. Actions: new-tab next-tab prev-tab");
     let _ = writeln!(w, "# select-tab-1..9 close-pane close-tab detach split-right split-down");
     let _ = writeln!(w, "# focus-left/right/up/down resize-left/right/up/down zoom toggle-panel");
-    let _ = writeln!(w, "# copy-mode command-palette send-prefix rename-tab session-picker");
+    let _ = writeln!(w, "# focus-panel copy-mode command-palette send-prefix rename-tab session-picker");
     let _ = writeln!(w, "[keys.bindings]");
     for (k, a) in DEFAULT_BINDINGS {
         let _ = writeln!(w, "{} = {}", toml_key(k), toml_str(a));
@@ -875,7 +879,8 @@ pub fn default_toml() -> String {
     let _ = writeln!(w, "right = {}\n", seg(&c.status.right));
 
     let p = &c.panel;
-    let _ = writeln!(w, "# Right panel (toggle with the toggle-panel key). Widgets: accounts sessions profiles");
+    let _ = writeln!(w, "# Right panel (toggle-panel key; focus-panel moves the keyboard into it).");
+    let _ = writeln!(w, "# Widgets, top to bottom: accounts sessions profiles");
     let _ = writeln!(w, "[panel]");
     let _ = writeln!(w, "visible = {}", p.visible);
     let _ = writeln!(w, "width = {}", p.width);

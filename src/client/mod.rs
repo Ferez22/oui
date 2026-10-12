@@ -1,15 +1,21 @@
 //! TUI client: tab bar, the active tab's panes, status bar, tmux-style prefix keys.
 //!
-//! `input` turns raw stdin into daemon messages, `render` draws the screen.
+//! `input` turns raw stdin into daemon messages, `render` draws the screen,
+//! `panel` is the right panel, `picker` the session picker and prompts.
 
 mod input;
+mod panel;
+mod picker;
 mod render;
 
 use crate::config::Config;
 use crate::profile;
 use crate::protocol::{ClientMsg, Layout, ServerMsg, read_msg, socket_path, write_msg};
 use anyhow::{Context, Result, bail};
-use input::{Input, Mode};
+use crate::config::Action;
+use input::{Input, Mode, UiEvent};
+use panel::{Here, Panel, RowAction};
+use picker::{PickOutcome, Prompt, PromptOutcome, SessionPicker};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::{execute, terminal};
@@ -20,7 +26,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 const CHROME_ROWS: u16 = 2; // tab bar + status bar
 
@@ -90,6 +96,21 @@ struct App {
     config: Config,
     /// Status bar `hostname` segment (looked up once).
     hostname: String,
+    panel: Panel,
+    /// Overlay holding the keyboard while `input.mode` is `Mode::Overlay`.
+    overlay: Option<Overlay>,
+    /// Terminal size (cols, rows).
+    term: (u16, u16),
+    cwd: String,
+    /// First-tab profile for sessions created from the session picker.
+    new_session_profile: Option<String>,
+    bg: UnboundedSender<panel::Bg>,
+}
+
+enum Overlay {
+    Panel,
+    Sessions(SessionPicker),
+    Rename(Prompt),
 }
 
 fn picker_options() -> Vec<(String, String)> {
@@ -126,13 +147,14 @@ pub async fn run(session: Option<String>, create: bool, profile: Option<String>)
     let (mut rd, mut wr) = stream.into_split();
 
     let (cols, rows) = terminal::size()?;
+    let panel_w = panel::width(config.panel.visible, config.panel.width, cols);
     write_msg(&mut wr, &ClientMsg::Attach {
         session,
         create,
-        profile,
+        profile: profile.clone(),
         cwd: cwd.clone(),
         rows: rows.saturating_sub(CHROME_ROWS),
-        cols,
+        cols: cols - panel_w,
     })
     .await?;
 
@@ -161,7 +183,22 @@ pub async fn run(session: Option<String>, create: bool, profile: Option<String>)
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     let input = Input::new(cwd.clone(), config.keys.clone(), config.general.default_profile.clone());
     let hostname = render::hostname();
-    let mut app = App { layout: None, screens: HashMap::new(), input, flash, config, hostname };
+    let (bg_tx, mut bg_rx) = unbounded_channel::<panel::Bg>();
+    let panel = Panel::new(config.panel.visible);
+    let mut app = App {
+        layout: None,
+        screens: HashMap::new(),
+        input,
+        flash,
+        config,
+        hostname,
+        panel,
+        overlay: None,
+        term: (cols, rows),
+        cwd: cwd.clone(),
+        new_session_profile: profile,
+        bg: bg_tx,
+    };
     // Redraw at least every second so the clock segment stays current.
     let mut tick = tokio::time::interval(Duration::from_secs(1));
 
@@ -183,11 +220,21 @@ pub async fn run(session: Option<String>, create: bool, profile: Option<String>)
                     app.flash = Some(f);
                 }
             }
-            _ = tick.tick() => {}
-            _ = winch.recv() => {
-                let (cols, rows) = terminal::size()?;
-                write_msg(&mut wr, &ClientMsg::Resize { rows: rows.saturating_sub(CHROME_ROWS), cols }).await?;
+            _ = tick.tick() => {
+                // Keep an open session picker's list current.
+                if matches!(app.overlay, Some(Overlay::Sessions(_))) {
+                    write_msg(&mut wr, &ClientMsg::ListSessions).await?;
+                }
             }
+            Some(bg) = bg_rx.recv() => app.panel.on_bg(bg),
+            _ = winch.recv() => {
+                app.term = terminal::size()?;
+                write_msg(&mut wr, &app.resize_msg()).await?;
+            }
+        }
+        // Panel, session picker and rename: keys and actions handled here.
+        for msg in app.update() {
+            write_msg(&mut wr, &msg).await?;
         }
         // Coalesce bursts of output into one redraw.
         let mut exit = None;
@@ -230,8 +277,206 @@ impl App {
                     p.process(&data);
                 }
             }
+            ServerMsg::Sessions(list) => self.panel.sessions = list,
             ServerMsg::Error(e) => self.flash = Some(e),
             _ => {}
         }
     }
+
+    /// Resize message for the pane area (terminal minus bars and panel).
+    fn resize_msg(&self) -> ClientMsg {
+        let (cols, rows) = self.term;
+        ClientMsg::Resize { rows: rows.saturating_sub(CHROME_ROWS), cols: cols - self.panel_width() }
+    }
+
+    fn panel_width(&self) -> u16 {
+        panel::width(self.panel.visible, self.config.panel.width, self.term.0)
+    }
+
+    /// Where the client is: active tab's profile and colour, session, tab count.
+    fn here(&self) -> Here<'_> {
+        let layout = self.layout.as_ref();
+        let tab = layout.and_then(|l| l.tabs.get(l.active));
+        Here {
+            profile: tab.map_or(profile::SYSTEM, |t| t.profile.as_str()),
+            profile_color: tab.map_or(ratatui::style::Color::Gray, |t| render::color(&t.color)),
+            session: layout.map_or("", |l| l.session.as_str()),
+            tabs: layout.map_or(0, |l| l.tabs.len()),
+        }
+    }
+
+    /// Attach this client to another (or a new) session.
+    fn switch_msg(&self, session: String, create: bool) -> ClientMsg {
+        let (cols, rows) = self.term;
+        ClientMsg::Attach {
+            session: Some(session),
+            create,
+            profile: self.new_session_profile.clone(),
+            cwd: self.cwd.clone(),
+            rows: rows.saturating_sub(CHROME_ROWS),
+            cols: cols - self.panel_width(),
+        }
+    }
+
+    fn close_overlay(&mut self) {
+        self.overlay = None;
+        self.panel.focused = false;
+        self.input.mode = Mode::Normal;
+    }
+
+    /// Handle client-side events from the last input, then refresh the panel
+    /// if due. Returns messages for the daemon.
+    fn update(&mut self) -> Vec<ClientMsg> {
+        let mut out = Vec::new();
+        for ev in std::mem::take(&mut self.input.ui) {
+            match ev {
+                UiEvent::Action(a) => self.on_action(a, &mut out),
+                UiEvent::Key(k) => match self.overlay {
+                    Some(_) => self.overlay_key(&k, &mut out),
+                    // The overlay closed earlier in this read: the key is the pane's.
+                    None => out.push(ClientMsg::Input(k)),
+                },
+            }
+        }
+        if self.layout.is_some() {
+            let profile = self.here().profile.to_string();
+            if self.panel.refresh(&profile, false, &self.bg) {
+                out.push(ClientMsg::ListSessions);
+            }
+        }
+        out
+    }
+
+    fn set_panel(&mut self, visible: bool, out: &mut Vec<ClientMsg>) {
+        if self.panel.visible == visible {
+            return;
+        }
+        self.panel.visible = visible;
+        out.push(self.resize_msg());
+        if visible {
+            let profile = self.here().profile.to_string();
+            if self.panel.refresh(&profile, true, &self.bg) {
+                out.push(ClientMsg::ListSessions);
+            }
+        }
+    }
+
+    fn on_action(&mut self, action: Action, out: &mut Vec<ClientMsg>) {
+        match action {
+            Action::TogglePanel => {
+                let visible = !self.panel.visible;
+                self.set_panel(visible, out);
+                if !visible && matches!(self.overlay, Some(Overlay::Panel)) {
+                    self.close_overlay();
+                }
+            }
+            Action::FocusPanel => {
+                self.set_panel(true, out);
+                if self.panel_width() == 0 {
+                    self.flash = Some("terminal too narrow for the panel".into());
+                    return self.close_overlay();
+                }
+                self.panel.focused = true;
+                self.overlay = Some(Overlay::Panel);
+            }
+            Action::SessionPicker => {
+                let here = self.here();
+                self.overlay = Some(Overlay::Sessions(SessionPicker::new(&self.panel.sessions, here.session)));
+                out.push(ClientMsg::ListSessions);
+            }
+            Action::RenameTab => {
+                let name = self.layout.as_ref().and_then(|l| l.tabs.get(l.active)).and_then(|t| t.name.clone());
+                self.overlay = Some(Overlay::Rename(Prompt::new("rename tab", name.as_deref().unwrap_or(""))));
+            }
+            _ => {}
+        }
+    }
+
+    fn overlay_key(&mut self, key: &[u8], out: &mut Vec<ClientMsg>) {
+        match self.overlay.take() {
+            Some(Overlay::Panel) => {
+                self.overlay = Some(Overlay::Panel);
+                self.panel_key(key, out);
+            }
+            Some(Overlay::Rename(mut p)) => match p.key(key) {
+                PromptOutcome::Pending => self.overlay = Some(Overlay::Rename(p)),
+                PromptOutcome::Cancel => self.close_overlay(),
+                PromptOutcome::Submit(name) => {
+                    out.push(ClientMsg::RenameTab((!name.is_empty()).then_some(name)));
+                    self.close_overlay();
+                }
+            },
+            Some(Overlay::Sessions(mut picker)) => {
+                let current = self.here().session.to_string();
+                match picker.key(key, &self.panel.sessions) {
+                    PickOutcome::Stay => self.overlay = Some(Overlay::Sessions(picker)),
+                    PickOutcome::Close => self.close_overlay(),
+                    PickOutcome::Switch(name) => {
+                        if name != current {
+                            out.push(self.switch_msg(name, false));
+                        }
+                        self.close_overlay();
+                    }
+                    PickOutcome::Create(name) => {
+                        out.push(self.switch_msg(name, true));
+                        out.push(ClientMsg::ListSessions);
+                        self.close_overlay();
+                    }
+                    PickOutcome::Kill(name) => {
+                        // Killing our own session: move to another one first if there is one.
+                        if name == current
+                            && let Some(other) = self.panel.sessions.iter().find(|s| s.name != name)
+                        {
+                            out.push(self.switch_msg(other.name.clone(), false));
+                        }
+                        out.push(ClientMsg::KillSession(name.clone()));
+                        // Panes exit asynchronously; drop it locally until the next list.
+                        self.panel.sessions.retain(|s| s.name != name);
+                        self.overlay = Some(Overlay::Sessions(picker));
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Panel focus: j/k/arrows move, Enter acts on the row, Esc/q/Tab go back to the panes.
+    fn panel_key(&mut self, key: &[u8], out: &mut Vec<ClientMsg>) {
+        let rows = |app: &App| app.panel.rows(&app.config.panel.widgets, &app.here(), ratatui::style::Color::Reset);
+        match key {
+            b"j" | b"\x1b[B" => {
+                let r = rows(self);
+                self.panel.move_sel(&r, 1);
+            }
+            b"k" | b"\x1b[A" => {
+                let r = rows(self);
+                self.panel.move_sel(&r, -1);
+            }
+            b"\x1b" | b"q" | b"\x03" | b"\t" => self.close_overlay(),
+            b"\r" | b"\n" => {
+                let Some(action) = self.panel.selected(rows(self)) else { return };
+                let profile = self.here().profile.to_string();
+                let tab_profile = |p: String| (p != profile::SYSTEM).then_some(p);
+                match action {
+                    RowAction::Login { tool, cmd, hint } => {
+                        if let Some(cmd) = cmd {
+                            out.push(ClientMsg::NewTab { profile: tab_profile(profile.clone()), cwd: self.cwd.clone(), cmd: Some(cmd) });
+                        }
+                        self.flash = Some(hint.unwrap_or_else(|| format!("{tool}: logging in for profile '{profile}'")));
+                    }
+                    RowAction::Session(name) => {
+                        if name != self.here().session {
+                            out.push(self.switch_msg(name, false));
+                        }
+                    }
+                    RowAction::Profile(name) => {
+                        out.push(ClientMsg::NewTab { profile: tab_profile(name), cwd: self.cwd.clone(), cmd: None });
+                    }
+                }
+                self.close_overlay();
+            }
+            _ => {}
+        }
+    }
 }
+

@@ -22,7 +22,7 @@ prefix = "C-b"
 # use "none" to remove a default binding. Actions: new-tab next-tab prev-tab
 # select-tab-1..9 close-pane close-tab detach split-right split-down
 # focus-left/right/up/down resize-left/right/up/down zoom toggle-panel
-# copy-mode command-palette send-prefix rename-tab session-picker
+# focus-panel copy-mode command-palette send-prefix rename-tab session-picker
 [keys.bindings]
 c = "new-tab"
 n = "next-tab"
@@ -57,6 +57,7 @@ K = "resize-up"
 J = "resize-down"
 z = "zoom"
 b = "toggle-panel"
+Tab = "focus-panel"
 "[" = "copy-mode"
 s = "session-picker"
 "," = "rename-tab"
@@ -86,7 +87,8 @@ base = "default"
 left = ["mode", "session", "profile"]
 right = ["hints", "clock"]
 
-# Right panel (toggle with the toggle-panel key). Widgets: accounts sessions profiles
+# Right panel (toggle-panel key; focus-panel moves the keyboard into it).
+# Widgets, top to bottom: accounts sessions profiles
 [panel]
 visible = false
 width = 32

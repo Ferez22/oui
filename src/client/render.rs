@@ -11,7 +11,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout as Split, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph};
 
 pub fn draw(app: &App, f: &mut Frame) {
     let [tabs_area, pane_area, status_area] =
@@ -37,10 +37,26 @@ pub fn draw(app: &App, f: &mut Frame) {
         } else {
             Style::new().fg(c)
         };
-        spans.push(Span::styled(format!(" {} {} ", i + 1, t.profile), style));
+        spans.push(Span::styled(tab_label(i, t), style));
         spans.push(Span::raw(" "));
     }
     f.render_widget(Paragraph::new(Line::from(spans)).style(bar), tabs_area);
+
+    // Right panel: takes its columns from the pane area (the daemon was told).
+    let panel_w = app.panel_width().min(pane_area.width);
+    let [pane_area, panel_area] =
+        Split::horizontal([Constraint::Min(1), Constraint::Length(panel_w)]).areas(pane_area);
+    let ostyle = super::picker::OverlayStyle::new(theme, pcolor);
+    if panel_w > 0 {
+        let rows = app.panel.rows(&app.config.panel.widgets, &app.here(), theme.accent.to_color(pcolor));
+        let footer = if app.panel.focused {
+            "j/k move · ⏎ open · esc back".to_string()
+        } else {
+            let k = app.input.keys.key_for(Action::FocusPanel).map(display_key);
+            k.map(|k| format!("{} {k} focus", display_key(&app.input.keys.prefix.notation))).unwrap_or_default()
+        };
+        app.panel.draw(f, panel_area, rows, &ostyle, &footer);
+    }
 
     if let Some(tab) = active {
         draw_tab(app, tab, pane_area, f);
@@ -58,7 +74,25 @@ pub fn draw(app: &App, f: &mut Frame) {
     f.render_widget(Paragraph::new(right).style(bar), r);
 
     if let Mode::Picker(sel) = app.input.mode {
-        draw_picker(f, sel);
+        draw_picker(f, sel, &ostyle);
+    }
+    let cursor = match &app.overlay {
+        Some(super::Overlay::Sessions(p)) => {
+            super::picker::draw_sessions(f, p, &app.panel.sessions, &layout.session, &ostyle)
+        }
+        Some(super::Overlay::Rename(p)) => Some(super::picker::draw_prompt(f, p, &ostyle, "⏎ save · empty clears · esc cancel")),
+        _ => None,
+    };
+    if let Some(pos) = cursor {
+        f.set_cursor_position(pos);
+    }
+}
+
+/// Tab bar label: " 1 profile " or " 1 name · profile " (the profile always shows).
+pub fn tab_label(i: usize, t: &TabInfo) -> String {
+    match &t.name {
+        Some(name) => format!(" {} {name} · {} ", i + 1, t.profile),
+        None => format!(" {} {} ", i + 1, t.profile),
     }
 }
 
@@ -108,8 +142,15 @@ impl StatusCtx<'_> {
         match seg {
             Segment::Mode => {
                 let mut v = Vec::new();
-                if !matches!(app.input.mode, Mode::Normal) {
-                    v.push(badge("PREFIX", theme.accent.to_color(self.pcolor)));
+                let mode = match (&app.input.mode, &app.overlay) {
+                    (Mode::Normal, _) => None,
+                    (Mode::Overlay, Some(super::Overlay::Panel)) => Some("PANEL"),
+                    (Mode::Overlay, Some(super::Overlay::Sessions(_))) => Some("SESSIONS"),
+                    (Mode::Overlay, Some(super::Overlay::Rename(_))) => Some("RENAME"),
+                    _ => Some("PREFIX"),
+                };
+                if let Some(m) = mode {
+                    v.push(badge(m, theme.accent.to_color(self.pcolor)));
                 }
                 if self.active.is_some_and(|t| t.zoomed) {
                     v.push(badge("ZOOM", self.pcolor));
@@ -166,7 +207,7 @@ pub fn hints(keys: &Keys) -> String {
 }
 
 /// Short form of a key for hints: "C-b" → "^b", "Left" → "←".
-fn display_key(notation: &str) -> String {
+pub fn display_key(notation: &str) -> String {
     match notation {
         "Left" => "←".into(),
         "Down" => "↓".into(),
@@ -272,16 +313,9 @@ fn draw_borders(panes: &[Rect], focused: Option<Rect>, colors: (Color, Color), a
     }
 }
 
-fn draw_picker(f: &mut Frame, sel: usize) {
+fn draw_picker(f: &mut Frame, sel: usize, st: &super::picker::OverlayStyle) {
     let opts = picker_options();
-    let h = opts.len() as u16 + 2;
-    let area = f.area();
-    let rect = Rect {
-        x: area.width.saturating_sub(36) / 2,
-        y: area.height.saturating_sub(h) / 2,
-        width: 36.min(area.width),
-        height: h.min(area.height),
-    };
+    let rect = super::picker::centered(f.area(), 36, opts.len() as u16 + 2);
     let items: Vec<ListItem> = opts
         .iter()
         .enumerate()
@@ -294,14 +328,14 @@ fn draw_picker(f: &mut Frame, sel: usize) {
         })
         .collect();
     let list = List::new(items)
-        .block(Block::new().borders(Borders::ALL).title(" new tab · profile "))
-        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        .block(st.block(" new tab · profile "))
+        .highlight_style(st.selected);
     let mut state = ListState::default().with_selected(Some(sel));
     f.render_widget(Clear, rect);
     f.render_stateful_widget(list, rect, &mut state);
 }
 
-fn color(name: &str) -> Color {
+pub fn color(name: &str) -> Color {
     name.parse().unwrap_or(Color::Blue)
 }
 
@@ -343,6 +377,14 @@ fn render_screen(screen: &vt100::Screen, area: Rect, buf: &mut Buffer) {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn tab_label_keeps_profile() {
+        let mut t = TabInfo { name: None, profile: "work".into(), color: "green".into(), panes: vec![], focused: 0, zoomed: false };
+        assert_eq!(tab_label(0, &t), " 1 work ");
+        t.name = Some("api".into());
+        assert_eq!(tab_label(2, &t), " 3 api · work ");
+    }
 
     #[test]
     fn hints_follow_bindings() {
