@@ -255,7 +255,9 @@ Every key can be changed in the config (e.g. `D = "none"` removes detach). Unkno
 
 **Mouse:** scroll wheel scrolls history, click focuses a split or tab, drag selects and copies. Programs that use the mouse themselves (vim, htop) get it instead. Hold **Shift** to use your terminal's own selection.
 
-**Clipboard:** copying works locally and over ssh (OSC 52), and also uses `pbcopy` / `wl-copy` / `xclip` when available.
+**Clipboard:** what you copy (copy mode, mouse drag) works locally and over ssh (OSC 52), and also uses `pbcopy` / `wl-copy` / `xclip` when available. When a program in a pane sets the clipboard (vim, tmux or ssh sessions using OSC 52), oUI only passes it on to your terminal as OSC 52, so your terminal's own clipboard setting decides (iTerm2: *Applications in terminal may access clipboard*). Only the focused pane can do this. Change it with `[clipboard] apps = "off"` (ignore), or `"system"` (also use `pbcopy` etc.; risky: anything printed in the pane, such as a file or a remote server, could then replace your clipboard).
+
+**Paste:** pastes are delimited (bracketed paste), so pasted text is never taken for oUI keys and a pasted command doesn't run on its own in shells that support it (zsh, bash 5.1+, fish). Pasting into the rename / new-session prompts works; yes/no questions and copy mode ignore pastes.
 
 ---
 

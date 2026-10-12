@@ -3,6 +3,13 @@
 //! Bytes are forwarded to the focused pane untouched, except the prefix key
 //! (`keys.prefix`, default Ctrl-b); the key after it is looked up in
 //! `keys.bindings` (see `config::Keys`).
+//!
+//! Pastes: the client turns on bracketed paste in the host terminal, so a
+//! paste arrives as `ESC [200~ … ESC [201~`. Its text is never read as keys
+//! (no prefix, bindings, mouse reports or repeat inside): it goes to the
+//! focused pane, re-bracketed if that pane asked for bracketed paste
+//! (`Input::bracketed`), or to a name prompt when an overlay is open. Copy
+//! mode, the new-tab picker and yes/no questions ignore pastes.
 
 use super::mouse::{MouseEvent, Parsed, parse_sgr};
 use super::picker_options;
@@ -11,12 +18,20 @@ use crate::layout::Dir;
 use crate::protocol::ClientMsg;
 use std::time::{Duration, Instant};
 
+/// Bracketed paste markers.
+pub const PASTE_START: &[u8] = b"\x1b[200~";
+pub const PASTE_END: &[u8] = b"\x1b[201~";
+
 const UP: &[u8] = b"\x1b[A";
 const DOWN: &[u8] = b"\x1b[B";
 
 /// How long after a focus/resize action the arrows keep working without the
 /// prefix (like tmux `bind -r` / `repeat-time`).
 pub const REPEAT: Duration = Duration::from_millis(600);
+
+/// How long a read ending in what may be the start of a paste marker (`ESC`,
+/// `ESC [`, `ESC [ 2`, …) waits for the rest before going out as keys.
+pub const MARKER_WAIT: Duration = Duration::from_millis(20);
 
 /// The key at the start of `bytes`: an arrow escape sequence (normalised to
 /// CSI) or a single byte. Returns the key and how many bytes it used.
@@ -138,6 +153,8 @@ pub enum UiEvent {
     Action(Action),
     /// A key pressed while in `Mode::Overlay`.
     Key(Vec<u8>),
+    /// Text pasted while in `Mode::Overlay` (possibly one part of a paste).
+    Paste(Vec<u8>),
     /// The prefix was pressed in `Mode::Overlay`: close the overlay (input is
     /// in prefix mode already), like the prefix leaves copy mode.
     Leave,
@@ -173,6 +190,55 @@ pub struct Input {
     /// Until then, arrows (and other non-letter focus/resize keys) work
     /// without the prefix again: set by a focus or resize action.
     pub repeat_until: Option<Instant>,
+    /// The focused pane turned on bracketed paste; set by the caller.
+    pub bracketed: bool,
+    /// Inside a paste: where its text goes (decided when it starts).
+    paste: Option<PasteTo>,
+    /// `pending` may be a cut-off paste marker: when to give up waiting
+    /// for the rest (`flush_held`).
+    pub hold_until: Option<Instant>,
+    /// Feeding held bytes for good: don't hold them again.
+    no_hold: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PasteTo {
+    /// The focused pane; `wrap`: re-bracket it.
+    Pane { wrap: bool },
+    /// The open overlay (`UiEvent::Paste`).
+    Ui,
+    /// Ignored (copy mode, new-tab picker).
+    Drop,
+}
+
+/// Position of `needle` in `hay`.
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Length of the end of `bytes` that could be the start of a paste marker
+/// cut off by the read (`ESC`, `ESC [`, … `ESC [ 2 0 1`).
+fn marker_tail(bytes: &[u8]) -> usize {
+    (1..PASTE_END.len())
+        .rev()
+        .find(|&k| bytes.len() >= k && [PASTE_START, PASTE_END].iter().any(|m| bytes.ends_with(&m[..k])))
+        .unwrap_or(0)
+}
+
+/// Pasted text without paste markers, so it can't end (or nest) the
+/// bracketed paste the pane sees.
+pub fn strip_markers(text: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if text[i..].starts_with(PASTE_START) || text[i..].starts_with(PASTE_END) {
+            i += PASTE_START.len();
+        } else {
+            out.push(text[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 impl Input {
@@ -188,6 +254,10 @@ impl Input {
             events: Vec::new(),
             pending: Vec::new(),
             repeat_until: None,
+            bracketed: false,
+            paste: None,
+            hold_until: None,
+            no_hold: false,
         }
     }
 
@@ -230,6 +300,7 @@ impl Input {
 
     /// Feed raw stdin bytes; returns the messages to send to the daemon.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<ClientMsg> {
+        self.hold_until = None;
         let joined;
         let bytes = if self.pending.is_empty() {
             bytes
@@ -241,6 +312,52 @@ impl Input {
         let mut pass = Vec::new();
         let mut i = 0;
         while i < bytes.len() {
+            // Inside a paste: everything up to the end marker is text.
+            if let Some(to) = self.paste {
+                let rest = &bytes[i..];
+                let (text_len, used) = match find(rest, PASTE_END) {
+                    Some(at) => (at, at + PASTE_END.len()),
+                    None => {
+                        let keep = marker_tail(rest);
+                        (rest.len() - keep, rest.len() - keep)
+                    }
+                };
+                self.paste_text(to, &rest[..text_len], &mut pass);
+                i += used;
+                if used > text_len {
+                    self.paste = None;
+                    if to == (PasteTo::Pane { wrap: true }) {
+                        pass.extend_from_slice(PASTE_END);
+                    }
+                } else if i < bytes.len() {
+                    self.pending = bytes[i..].to_vec();
+                    break;
+                }
+                continue;
+            }
+            if bytes[i] == 0x1b {
+                let rest = &bytes[i..];
+                if rest.starts_with(PASTE_START) {
+                    i += PASTE_START.len();
+                    self.start_paste(&mut pass);
+                    continue;
+                }
+                // An end marker without a start: drop it.
+                if rest.starts_with(PASTE_END) {
+                    i += PASTE_END.len();
+                    continue;
+                }
+                // Maybe a start marker cut off by the read: wait a moment for
+                // the rest. A lone ESC is the Esc key when it is the whole
+                // read or follows the prefix: not held.
+                let cut = rest.len() < PASTE_START.len() && PASTE_START.starts_with(rest);
+                let lone_esc = rest.len() == 1 && (i == 0 || matches!(self.mode, Mode::Prefix));
+                if cut && !self.no_hold && !lone_esc {
+                    self.pending = rest.to_vec();
+                    self.hold_until = Some(Instant::now() + MARKER_WAIT);
+                    break;
+                }
+            }
             if self.mouse && bytes[i] == 0x1b {
                 match parse_sgr(&bytes[i..]) {
                     Parsed::Event(ev, n) => {
@@ -366,6 +483,52 @@ impl Input {
             out.push(ClientMsg::Input(pass));
         }
         out
+    }
+
+    /// The rest of a held marker didn't come (`hold_until` passed): the held
+    /// bytes were keys after all.
+    pub fn flush_held(&mut self) -> Vec<ClientMsg> {
+        self.hold_until = None;
+        let held = std::mem::take(&mut self.pending);
+        self.no_hold = true;
+        let out = self.feed(&held);
+        self.no_hold = false;
+        out
+    }
+
+    /// A paste starts: decide where its text goes.
+    fn start_paste(&mut self, pass: &mut Vec<u8>) {
+        self.repeat_until = None;
+        let to = match self.mode {
+            // Pasted right after the prefix: the prefix is cancelled.
+            Mode::Normal | Mode::Prefix => {
+                self.mode = Mode::Normal;
+                PasteTo::Pane { wrap: self.bracketed }
+            }
+            Mode::Overlay => PasteTo::Ui,
+            Mode::Copy => {
+                self.flash = Some("paste ignored in copy mode (q leaves it)".into());
+                PasteTo::Drop
+            }
+            Mode::Picker(_) => PasteTo::Drop,
+        };
+        if to == (PasteTo::Pane { wrap: true }) {
+            pass.extend_from_slice(PASTE_START);
+        }
+        self.paste = Some(to);
+    }
+
+    /// Text of the paste in progress (all or part of it).
+    fn paste_text(&mut self, to: PasteTo, text: &[u8], pass: &mut Vec<u8>) {
+        let text = strip_markers(text);
+        if text.is_empty() {
+            return;
+        }
+        match to {
+            PasteTo::Pane { .. } => pass.extend_from_slice(&text),
+            PasteTo::Ui => self.ui.push(UiEvent::Paste(text)),
+            PasteTo::Drop => {}
+        }
     }
 
     /// Turn an action into a daemon message (or a local mode change).
@@ -654,5 +817,115 @@ mod tests {
         assert!(inp.events.is_empty());
         assert_eq!(dbg(&inp.feed(b"\x02z")), ["Zoom"]);
         assert!(matches!(inp.mode, Mode::Normal));
+    }
+
+    fn input(data: &[u8]) -> String {
+        format!("{:?}", ClientMsg::Input(data.to_vec()))
+    }
+
+    #[test]
+    fn paste_is_never_keys() {
+        // Prefix, a bound key, a mouse report, Enter: all one opaque paste.
+        let paste = b"\x02%\x1b[<0;5;5Mecho x\r";
+        for (bracketed, mouse) in [(false, false), (false, true), (true, true)] {
+            let mut inp = Input::new("/tmp".into(), Keys::default(), None);
+            inp.bracketed = bracketed;
+            inp.mouse = mouse;
+            let out = inp.feed(&[b"a", PASTE_START, paste, PASTE_END, b"b"].concat());
+            let want = if bracketed { [b"a", PASTE_START, paste, PASTE_END, b"b"].concat() } else { [b"a", &paste[..], b"b"].concat() };
+            assert_eq!(dbg(&out), [input(&want)], "bracketed {bracketed}");
+            assert!(inp.events.is_empty() && inp.ui.is_empty() && inp.flash.is_none());
+            assert!(matches!(inp.mode, Mode::Normal));
+        }
+    }
+
+    #[test]
+    fn paste_markers_split_across_reads() {
+        let all = [b"ls", PASTE_START, b"\x02z\r", PASTE_END, b"\x02z"].concat();
+        for bracketed in [false, true] {
+            let body = if bracketed { [PASTE_START, b"\x02z\r", PASTE_END].concat() } else { b"\x02z\r".to_vec() };
+            // Every split point, including inside both markers.
+            for cut in 1..all.len() {
+                let mut inp = Input::new("/tmp".into(), Keys::default(), None);
+                inp.bracketed = bracketed;
+                let mut out = inp.feed(&all[..cut]);
+                out.extend(inp.feed(&all[cut..]));
+                let mut sent = Vec::new();
+                let mut rest = Vec::new();
+                for m in &out {
+                    match m {
+                        ClientMsg::Input(d) => sent.extend_from_slice(d),
+                        m => rest.push(format!("{m:?}")),
+                    }
+                }
+                assert_eq!(sent, [&b"ls"[..], &body].concat(), "cut {cut} bracketed {bracketed}");
+                // Only the prefix typed after the paste acts.
+                assert_eq!(rest, ["Zoom"], "cut {cut}");
+            }
+        }
+        // A paste over several reads with the end marker split ESC | [201~.
+        let mut inp = Input::new("/tmp".into(), Keys::default(), None);
+        assert_eq!(dbg(&inp.feed(&[PASTE_START, b"one\r"].concat())), [input(b"one\r")]);
+        assert_eq!(dbg(&inp.feed(b"\x02%two\x1b")), [input(b"\x02%two")]);
+        assert!(inp.feed(b"[201~").is_empty());
+        assert_eq!(dbg(&inp.feed(b"\x02%")), [r#"Split { down: false, cwd: "/tmp" }"#]);
+    }
+
+    #[test]
+    fn held_marker_start_times_out_as_keys() {
+        let mut inp = Input::new("/tmp".into(), Keys::default(), None);
+        // A read that is only ESC is the Esc key.
+        assert_eq!(dbg(&inp.feed(b"\x1b")), [input(b"\x1b")]);
+        assert!(inp.hold_until.is_none());
+        // ESC ending a longer read, or ESC [ 2: maybe a cut-off paste start.
+        for (read, now, later) in [(&b"a\x1b"[..], &b"a"[..], &b"\x1b"[..]), (b"\x1b[2", b"", b"\x1b[2")] {
+            let out = inp.feed(read);
+            assert_eq!(dbg(&out), if now.is_empty() { vec![] } else { vec![input(now)] });
+            assert!(inp.hold_until.is_some());
+            assert_eq!(dbg(&inp.flush_held()), [input(later)]);
+            assert!(inp.hold_until.is_none());
+        }
+    }
+
+    #[test]
+    fn paste_after_prefix_cancels_it() {
+        let mut inp = Input::new("/tmp".into(), Keys::default(), None);
+        let out = inp.feed(&[b"\x02", PASTE_START, b"z", PASTE_END].concat());
+        assert_eq!(dbg(&out), [input(b"z")]);
+        assert!(matches!(inp.mode, Mode::Normal));
+        // A stray end marker is dropped.
+        assert_eq!(dbg(&inp.feed(&[b"a", PASTE_END, b"b"].concat())), [input(b"ab")]);
+    }
+
+    #[test]
+    fn embedded_markers_are_stripped() {
+        assert_eq!(strip_markers(b"a\x1b[201~b\x1b[200~c\x1b[20"), b"abc\x1b[20");
+        // A nested start marker (even split across reads) never reaches the pane.
+        let mut inp = Input::new("/tmp".into(), Keys::default(), None);
+        inp.bracketed = true;
+        let mut out = inp.feed(&[PASTE_START, b"x\x1b[20"].concat());
+        out.extend(inp.feed(&[b"0~y", PASTE_END].concat()));
+        let sent: Vec<u8> = out.iter().flat_map(|m| if let ClientMsg::Input(d) = m { d.clone() } else { vec![] }).collect();
+        assert_eq!(sent, [PASTE_START, b"xy", PASTE_END].concat());
+    }
+
+    #[test]
+    fn paste_in_overlays_and_copy_mode() {
+        let mut inp = Input::new("/tmp".into(), Keys::default(), None);
+        // Close-pane confirmation: a pasted "y" is text for the app, never a key.
+        assert!(inp.feed(&[b"\x02x", PASTE_START, b"y\r", PASTE_END].concat()).is_empty());
+        assert_eq!(inp.ui, [UiEvent::Action(Action::ClosePane), UiEvent::Paste(b"y\r".to_vec())]);
+        assert!(matches!(inp.mode, Mode::Overlay));
+        inp.ui.clear();
+        // Copy mode ignores pastes (no copy keys).
+        inp.mode = Mode::Normal;
+        assert!(inp.feed(&[b"\x02[", PASTE_START, b"q/x\r", PASTE_END].concat()).is_empty());
+        assert_eq!(inp.events, [Event::EnterCopy]);
+        assert!(matches!(inp.mode, Mode::Copy));
+        assert!(inp.flash.take().is_some());
+        // New-tab picker: ignored too (a pasted digit doesn't pick).
+        inp.mode = Mode::Normal;
+        assert!(inp.feed(&[b"\x02c", PASTE_START, b"1\r", PASTE_END].concat()).is_empty());
+        assert!(matches!(inp.mode, Mode::Picker(_)));
     }
 }
