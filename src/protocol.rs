@@ -19,11 +19,16 @@ pub fn socket_path() -> Result<PathBuf> {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ClientMsg {
     /// Attach to `session` (or the most recent one). With `create`, a missing
-    /// session is created with a first tab in `profile`.
+    /// session is created with a first tab in `profile`. Sending it again on an
+    /// attached connection switches this client to another session.
     Attach { session: Option<String>, create: bool, profile: Option<String>, cwd: String, rows: u16, cols: u16 },
     Input(#[serde(with = "serde_bytes")] Vec<u8>),
     Resize { rows: u16, cols: u16 },
-    NewTab { profile: Option<String>, cwd: String },
+    /// New tab in `profile`; `cmd` is typed into its shell (plus Enter) right
+    /// after it starts (e.g. a tool's login command).
+    NewTab { profile: Option<String>, cwd: String, cmd: Option<String> },
+    /// Name the active tab (`None` clears it).
+    RenameTab(Option<String>),
     SelectTab(usize),
     NextTab,
     PrevTab,
@@ -59,6 +64,8 @@ pub struct PaneInfo {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TabInfo {
+    /// User-given name (`RenameTab`); the profile is always shown as well.
+    pub name: Option<String>,
     pub profile: String,
     pub color: String,
     /// Every pane of the tab; when zoomed only `focused` is visible (full area).
@@ -74,7 +81,7 @@ pub struct Layout {
     pub active: usize,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct SessionInfo {
     pub name: String,
     pub tabs: usize,

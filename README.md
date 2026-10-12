@@ -25,7 +25,11 @@ Inside a tab, log in as usual (`claude` → `/login`, `railway login`, `gh auth 
 | `Ctrl-b x` / `&` | close pane / close tab |
 | `Ctrl-b d` | detach (shells keep running) |
 | `Ctrl-b Ctrl-b` | send a literal Ctrl-b |
-| `Ctrl-b b` / `[` / `s` / `,` | right panel / copy mode / session picker / rename tab (coming soon) |
+| `Ctrl-b b` | show/hide the right panel: connected accounts for this tab's profile, sessions, profiles |
+| `Ctrl-b Tab` | focus the panel: `j`/`k` move, `Enter` logs in to the tool (new tab, same profile) / switches session / opens a tab in that profile, `Esc` back |
+| `Ctrl-b s` | session picker: `Enter` switch, `n` new, `x` kill (asks y/n) |
+| `Ctrl-b ,` | rename the tab (shown as `1 name · profile`; empty clears) |
+| `Ctrl-b [` | copy mode (coming soon) |
 
 The prefix and every key above can be changed in the config file.
 

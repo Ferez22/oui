@@ -192,7 +192,7 @@ wait_for '^SH=/bin/bash' "general.shell overrides \$SHELL"
 t send-keys C-a v
 wait_for '│\$' "remapped split key (prefix C-a v)"
 t send-keys C-a b
-wait_for 'toggle-panel: not available yet' "unimplemented action flashes"
+wait_for 'ACCOUNTS · cfgp' "remapped prefix opens the panel (C-a b)"
 t send-keys C-a d
 wait_for 'detached from session' "detach with C-a d"
 
@@ -202,6 +202,86 @@ t new -d -s g -x 160 -y 30 "'$bin' new -s ghost; sleep 60"
 wait_for 'oUI +1 system' "missing default_profile falls back to system"
 wait_for "default_profile: profile 'ghost' not found" "and warns in the status bar"
 t send-keys C-a d
+wait_for 'detached from session' "detach"
+
+# --- Right panel (connected accounts), session picker, rename tab.
+# Fake login files in one profile, none in another. Fake gh/railway/claude
+# come first on PATH so "installed" doesn't depend on this machine and the
+# panel's one-key login never starts a real login flow.
+"$bin" kill-server >/dev/null
+: >"$OUI_HOME/config.toml" # defaults: prefix C-b, panel hidden
+fakebin=$dir/bin
+mkdir -p "$fakebin"
+for tool in gh railway claude; do
+    printf '#!/bin/sh\necho "FAKE-%s $*"\n' "$tool" >"$fakebin/$tool"
+    chmod +x "$fakebin/$tool"
+done
+"$bin" profile new acct --fresh --color cyan >/dev/null
+"$bin" profile new blank --fresh --color red >/dev/null
+for p in acct blank; do
+    printf "PS1='\$ '\nPATH=%s:\$PATH\n" "$fakebin" >"$OUI_HOME/profiles/$p/home/.profile"
+done
+ah=$OUI_HOME/profiles/acct/home
+mkdir -p "$ah/.config/gh" "$ah/.railway"
+printf 'github.com:\n    user: test-user\n' >"$ah/.config/gh/hosts.yml"
+printf '{"user":{"token":"dummy-not-a-real-token"}}\n' >"$ah/.railway/config.json"
+
+t kill-session -t g
+t new -d -s p -x 120 -y 30 -e "PATH=$fakebin:$PATH" "'$bin' new -s panel -p acct; sleep 60"
+wait_for 'oUI +1 acct' "session in profile 'acct'"
+wait_for '^\$' "shell prompt"
+t send-keys 'tput cols' Enter
+wait_for '^120$' "panel hidden: pane is 120 columns"
+t send-keys C-b b
+wait_for 'ACCOUNTS · acct' "prefix b shows the panel"
+wait_for '│ ● gh +test-user' "panel: gh logged in as test-user"
+wait_for '│ ● railway +logged in' "panel: railway logged in"
+wait_for '│ ▸ panel +1 tab' "panel: sessions widget marks the current one"
+wait_for '│ ● blank +fresh' "panel: profiles widget"
+t send-keys 'clear; tput cols' Enter
+wait_for '^88 +│' "panel shown: pane reflows to 88 columns"
+
+t send-keys C-b c 2
+wait_for '2 blank' "new tab in profile 'blank'"
+wait_for 'ACCOUNTS · blank' "panel follows the active tab's profile"
+wait_for '│ ○ gh +logged out' "panel: gh logged out in the fresh profile"
+wait_for '│ ○ railway +logged out' "panel: railway logged out in the fresh profile"
+echo "--- panel (profile blank):"; screen | cut -c89- | sed -n '2,20p'
+
+t send-keys C-b Tab
+wait_for ' PANEL ' "prefix Tab focuses the panel"
+t send-keys j Enter # rows: claude, railway, …
+wait_for '3 blank' "Enter on an account opens a login tab in the same profile"
+wait_for '^FAKE-railway login' "the login tab runs the tool's login command"
+wait_for "railway: logging in for profile 'blank'" "and says so"
+
+t send-keys C-b ,
+wait_for ' rename tab ' "prefix , opens the rename prompt"
+t send-keys api Enter
+wait_for '3 api · blank' "renamed tab shows name and profile"
+
+t send-keys C-b s
+wait_for '▸ panel +3 tabs' "prefix s opens the session picker"
+t send-keys n other Enter
+wait_for ' other │' "picker creates and switches to a new session"
+wait_for 'oUI +1 acct *$' "new session has one tab"
+t send-keys C-b s
+wait_for '  panel +3 tabs' "picker lists both sessions"
+t send-keys j Enter
+wait_for '3 api · blank' "picker switches back"
+t send-keys C-b s
+t send-keys j x
+wait_for "kill 'other' and its shells\? y/n" "kill asks for confirmation"
+t send-keys y
+for _ in $(seq 50); do "$bin" ls | grep -q '^other:' || break; sleep 0.1; done
+if "$bin" ls | grep -q '^other:'; then echo "FAIL picker kills a session" >&2; exit 1; fi
+echo "ok   picker kills a session"
+t send-keys Escape
+
+t send-keys C-b b
+t send-keys 'clear; tput cols' Enter
+wait_for '^120$' "panel hidden again: pane back to 120 columns"
+t send-keys C-b d
 wait_for 'detached from session' "detach"
 
 echo "all e2e checks passed (temp dirs: $dir $sockdir)"

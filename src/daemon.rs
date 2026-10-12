@@ -38,6 +38,8 @@ struct Pane {
 
 /// A tab is a profile boundary: every pane in it runs in `profile`.
 struct Tab {
+    /// User-given name, shown next to the profile.
+    name: Option<String>,
     /// `None` = system (no isolation).
     profile: Option<String>,
     color: String,
@@ -253,10 +255,22 @@ impl State {
                 let name = self.client_session(id)?;
                 self.resize(&name, rows, cols)?;
             }
-            ClientMsg::NewTab { profile, cwd } => {
+            ClientMsg::NewTab { profile, cwd, cmd } => {
                 let name = self.client_session(id)?;
                 let pane = self.spawn_tab(&name, profile.as_deref(), &cwd)?;
+                if let Some(cmd) = cmd.filter(|c| !c.trim().is_empty())
+                    && let Some(p) = self.panes.get_mut(&pane)
+                {
+                    // The PTY buffers it until the shell reads its first line.
+                    p.writer.write_all(format!("{cmd}\r").as_bytes())?;
+                    p.writer.flush()?;
+                }
                 self.send_snapshot(pane);
+                self.send_layout(&name);
+            }
+            ClientMsg::RenameTab(new) => {
+                let new = new.map(|n| clean_tab_name(&n)).filter(|n| !n.is_empty());
+                let (name, _) = self.with_tab(id, |t, _| t.name = new)?;
                 self.send_layout(&name);
             }
             ClientMsg::SelectTab(i) => self.select(id, |_, n| i.min(n - 1))?,
@@ -384,7 +398,7 @@ impl State {
         };
         let (id, color) = self.spawn_pane(session, profile, cwd, rows, cols)?;
         let s = self.session_mut(session)?;
-        s.tabs.push(Tab { profile: profile.map(Into::into), color, root: Node::Leaf(id), focused: id, zoomed: false });
+        s.tabs.push(Tab { name: None, profile: profile.map(Into::into), color, root: Node::Leaf(id), focused: id, zoomed: false });
         s.active = s.tabs.len() - 1;
         Ok(id)
     }
@@ -443,7 +457,7 @@ impl State {
         })?;
         let focused = root.leaves()[0];
         let s = self.session_mut(session)?;
-        s.tabs.push(Tab { profile: profile.map(Into::into), color, root, focused, zoomed: false });
+        s.tabs.push(Tab { profile: profile.map(Into::into), name: None, color, root, focused, zoomed: false });
         Ok(())
     }
 
@@ -603,6 +617,7 @@ impl State {
                 .tabs
                 .iter()
                 .map(|t| TabInfo {
+                    name: t.name.clone(),
                     profile: t.profile.clone().unwrap_or_else(|| profile::SYSTEM.into()),
                     color: t.color.clone(),
                     panes: t.geometry(area).into_iter().map(|(id, rect)| PaneInfo { id, rect }).collect(),
@@ -641,6 +656,11 @@ impl State {
     fn focused_pane(&mut self, client: u64) -> Result<u32> {
         Ok(self.with_tab(client, |t, _| t.focused)?.1)
     }
+}
+
+/// Tab names are one short line of printable text.
+fn clean_tab_name(name: &str) -> String {
+    name.chars().filter(|c| !c.is_control()).take(32).collect::<String>().trim().to_string()
 }
 
 /// Current directory of process `pid`, so a split starts where the focused shell is.
