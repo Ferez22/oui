@@ -136,6 +136,8 @@ pub struct Confirm {
     pub title: String,
     pub text: String,
     action: Action,
+    /// Closing would end oUI: `d` detaches instead (shells keep running).
+    pub offer_detach: bool,
 }
 
 pub struct TmuxOffer {
@@ -430,6 +432,7 @@ impl App {
                         title: format!("close {what}"),
                         text: format!("Close this {what}? {list} {verb} still running in it."),
                         action,
+                        offer_detach: false,
                     }));
                 }
             }
@@ -552,14 +555,19 @@ impl App {
         let panes = layout.and_then(|l| l.tabs.get(l.active)).map_or(0, |t| t.panes.len());
         let ends = |title: &str| Confirm {
             title: title.into(),
-            text: format!("Close oUI? This ends session '{session}' and its shells."),
+            text: format!(
+                "Close oUI? This ends session '{session}' and its shells. \
+                 Or detach: oUI closes, shells keep running (`oui attach` to come back)."
+            ),
             action,
+            offer_detach: true,
         };
         let confirm = match action {
             Action::Detach => Confirm {
                 title: "detach".into(),
                 text: "Detach from oUI? Your shells keep running; reattach with `oui attach`.".into(),
                 action,
+                offer_detach: false,
             },
             Action::ClosePane if tabs <= 1 && panes <= 1 => ends("close pane"),
             Action::CloseTab if tabs <= 1 => ends("close tab"),
@@ -676,6 +684,8 @@ impl App {
             Some(Overlay::Confirm(c)) => {
                 if key == b"y" || key == b"Y" {
                     out.extend(Self::action_msg(c.action));
+                } else if c.offer_detach && (key == b"d" || key == b"D") {
+                    out.push(ClientMsg::Detach);
                 }
                 self.close_overlay();
             }

@@ -263,9 +263,10 @@ pub const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("7", "select-tab-7"),
     ("8", "select-tab-8"),
     ("9", "select-tab-9"),
+    ("d", "close-pane"),
     ("x", "close-pane"),
     ("&", "close-tab"),
-    ("d", "detach"),
+    ("D", "detach"),
     ("%", "split-right"),
     ("|", "split-right"),
     ("\"", "split-down"),
@@ -956,7 +957,8 @@ mod tests {
         assert_eq!(keys.bound(b"\x02"), Some(Action::SendPrefix));
         assert_eq!(keys.bound(b"\x1b"), None);
         assert_eq!(keys.bound(b"y"), None);
-        assert_eq!(keys.key_for(Action::Detach), Some("d"));
+        assert_eq!(keys.key_for(Action::Detach), Some("D"));
+        assert_eq!(keys.key_for(Action::ClosePane), Some("d"));
 
         // Whole keys: Esc bound alone is not an arrow.
         let c = Config::parse("[keys]\nprefix = \"C-a\"\n[keys.bindings]\nEsc = \"detach\"\nM-Up = \"zoom\"\nc = \"none\"", None)

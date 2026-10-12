@@ -146,18 +146,18 @@ for _ in $(seq 50); do screen | grep -q '├' || break; sleep 0.1; done
 if screen | grep -q '├'; then echo "FAIL closing a pane collapses the layout" >&2; screen >&2; exit 1; fi
 echo "ok   closing a pane collapses the layout"
 
-t send-keys C-b d
+t send-keys C-b D
 wait_for 'Detach from oUI\? Your shells keep running' "detach asks for confirmation"
 t send-keys n
 sleep 0.2
 no_leak 'Detach from oUI' "n keeps the client"
-t send-keys C-b d Escape
+t send-keys C-b D Escape
 sleep 0.2
 no_leak 'Detach from oUI' "Esc keeps the client"
-t send-keys C-b d Enter
+t send-keys C-b D Enter
 sleep 0.2
 no_leak 'Detach from oUI|detached from' "Enter (default) keeps the client"
-t send-keys C-b d y
+t send-keys C-b D y
 wait_for "detached from session 'demo'. Your shells keep running; reattach with: oui attach demo" "y detaches, with a reattach hint"
 if ! "$bin" ls | grep -q '^demo: 1 tab'; then echo "FAIL session survives detach" >&2; exit 1; fi
 echo "ok   session survives detach"
@@ -200,7 +200,7 @@ t send-keys C-b 2
 wait_for '^TAB-TWO' "second tab runs its command in its own profile"
 t send-keys 'echo MARK-$((6*7)) $OUI_PROFILE' Enter
 wait_for '^MARK-42 personal' "second tab runs in profile 'personal'"
-t send-keys C-b d y # detach asks first
+t send-keys C-b D y # detach asks first
 wait_for 'detached from session' "detach from workspace"
 
 t new-window "'$bin' open proj; sleep 60"
@@ -218,7 +218,7 @@ grep -q "proj\"" "$saved" || fail "saved cwd: $(cat "$saved")"
 if "$bin" workspace save proj saved 2>/dev/null; then fail "save refuses to overwrite"; fi
 echo "ok   workspace save writes profiles, splits and cwd"
 
-t send-keys C-b d y # detach asks first
+t send-keys C-b D y # detach asks first
 wait_for 'detached from session' "detach again"
 "$bin" kill proj >/dev/null
 t new-window "'$bin' open saved; sleep 60"
@@ -226,7 +226,7 @@ wait_for '1 work +2 personal' "saved workspace reopens with both tabs"
 wait_for '├─' "saved workspace restores the split tree"
 "$bin" ls | grep -q '^saved: 2 tab' || fail "saved session has 2 tabs"
 echo "ok   workspace save round-trips"
-t send-keys C-b d y # detach asks first
+t send-keys C-b D y # detach asks first
 wait_for 'detached from session' "detach from saved workspace"
 
 # --- Custom config: prefix, a remapped key, theme, status segments, general.
@@ -267,7 +267,7 @@ t send-keys C-a v
 wait_for '│\$' "remapped split key (prefix C-a v)"
 t send-keys C-a b
 wait_for 'ACCOUNTS · cfgp' "remapped prefix opens the panel (C-a b)"
-t send-keys C-a d y # detach asks first
+t send-keys C-a D y # detach asks first
 wait_for 'detached from session' "detach with C-a d"
 
 sed -i.bak 's/^default_profile = .*/default_profile = "ghost"/' "$OUI_HOME/config.toml"
@@ -275,7 +275,7 @@ t kill-session -t c
 t new -d -s g -x 160 -y 30 "'$bin' new -s ghost; sleep 60"
 wait_for 'oUI +1 system' "missing default_profile falls back to system"
 wait_for "default_profile: profile 'ghost' not found" "and warns in the status bar"
-t send-keys C-a d y # detach asks first
+t send-keys C-a D y # detach asks first
 wait_for 'detached from session' "detach"
 
 # --- Right panel (connected accounts), session picker, rename tab.
@@ -355,7 +355,7 @@ t send-keys Escape
 t send-keys C-b b
 t send-keys 'clear; tput cols' Enter
 wait_for '^120$' "panel hidden again: pane back to 120 columns"
-t send-keys C-b d y # detach asks first
+t send-keys C-b D y # detach asks first
 wait_for 'detached from session' "detach"
 
 # ---- macOS: per-profile keychains ----
@@ -423,7 +423,7 @@ if [ "$(uname)" = Darwin ]; then
     wait_for '^KC-42' "first pane spawn creates the keychain; tools can store items"
     [ -f "$(pkc legacy)" ] && unlocked legacy && login_item legacy || fail "legacy profile: keychain + secure password created lazily"
     ok "legacy profile: keychain created lazily in secure mode"
-    t send-keys C-b d y
+    t send-keys C-b D y
     wait_for 'detached from session' "detach"
 
     # Errors never block the shell: a warning, then the command runs.
@@ -438,7 +438,7 @@ if [ "$(uname)" = Darwin ]; then
     wait_for "oUI ▸ profile 'kcfile' keychain not ready" "pane shows the keychain warning"
     t send-keys 'echo PANE-$((6*7))' Enter
     wait_for '^PANE-42' "and its shell still starts"
-    t send-keys C-b d y
+    t send-keys C-b D y
     wait_for 'detached from session' "detach"
     mv "$dir/kcfile.pw" "$(pdir kcfile)/keychain.pw"
 
@@ -574,7 +574,7 @@ for _ in $(seq 50); do screen | grep -q ' PANEL ' || break; sleep 0.1; done
 if screen | grep -q ' PANEL '; then echo "FAIL prefix Tab leaves panel focus" >&2; screen >&2; exit 1; fi
 echo "ok   prefix Tab leaves panel focus"
 t send-keys C-b b
-t send-keys C-b d y # detach asks first
+t send-keys C-b D y # detach asks first
 wait_for 'detached from session' "detach"
 
 # Reattached clients get the history from the daemon; apps' OSC 52 is forwarded.
@@ -587,7 +587,7 @@ wait_for '^1 +│' "history from the daemon after reattach"
 t send-keys q
 t send-keys "printf '\\033]52;c;%s\\007' \$(printf APPCLIP | base64)" Enter
 clip_is "APPCLIP" "OSC 52 from an app in a pane reaches the clipboard"
-t send-keys C-b d y # detach asks first
+t send-keys C-b D y # detach asks first
 wait_for 'detached from session' "detach"
 
 
@@ -645,7 +645,7 @@ wait_for "Close oUI\? This ends session 'solo' and its shells. y/n" "killing the
 t send-keys n Escape
 "$bin" ls | grep -q '^solo:' || fail "n keeps it"
 echo "ok   n keeps it"
-t send-keys C-b d y
+t send-keys C-b D y
 wait_for 'detached from session' "detach"
 
 # --- First launch with a tmux config: offer to import it (fake HOME only).
@@ -671,7 +671,7 @@ t send-keys n
 wait_for 'tmux config not imported' "n skips"
 if [ -e "$OUI_HOME/config.toml" ]; then fail "n writes nothing"; fi
 echo "ok   n writes nothing"
-t send-keys C-b d y
+t send-keys C-b D y
 wait_for 'detached from session' "detach"
 start
 wait_for 'Found your tmux config' "offered again after n"
@@ -680,12 +680,12 @@ wait_for "won't ask again" "d: don't ask again"
 grep -q "don't ask again" "$OUI_HOME/config.toml" || fail "d writes a minimal config"
 "$bin" config check >/dev/null || fail "minimal config is valid"
 echo "ok   d writes a minimal valid config"
-t send-keys C-b d y
+t send-keys C-b D y
 wait_for 'detached from session' "detach"
 start
 wait_for '^\$' "shell prompt"
 no_leak 'Found your tmux config' "not offered again after d"
-t send-keys C-b d y
+t send-keys C-b D y
 wait_for 'detached from session' "detach"
 rm "$OUI_HOME/config.toml"
 start
@@ -698,8 +698,39 @@ t send-keys Enter # any key clears the message
 wait_for '\^a c tab' "hints use the imported prefix right away"
 t send-keys C-a v
 wait_for '│\$' "imported binding works live (C-a v splits)"
-t send-keys C-a d y
+t send-keys C-a D y
 wait_for 'detached from session' "detach with the imported prefix"
 rm "$HOME/.tmux.conf"
+
+# --- d closes the focused split; on the very last one oUI asks, offering detach.
+"$bin" kill-server >/dev/null
+printf '[general]\ndefault_profile = "personal"\n' >"$OUI_HOME/config.toml"
+t new -d -s dd -x 120 -y 30 "'$bin' new -s dsplit; sleep 60"
+t switch-client -t dd 2>/dev/null || true
+tdd() { tmux -L "$tm" send-keys -t dd "$@"; }
+sdd() { tmux -L "$tm" capture-pane -p -t dd; }
+# Pane rows only (the status bar also contains │).
+split_shown() { sdd | sed -n '2,29p' | grep -q '│'; }
+for _ in $(seq 50); do sdd | grep -q 'd close pane' && break; sleep 0.1; done
+tdd C-b %
+for _ in $(seq 50); do split_shown && break; sleep 0.1; done
+split_shown || { echo "FAIL split before d" >&2; exit 1; }
+tdd C-b d
+for _ in $(seq 50); do split_shown || break; sleep 0.1; done
+if split_shown; then echo "FAIL d closes the focused split" >&2; sdd >&2; exit 1; fi
+echo "ok   d closes the focused split"
+tdd C-b d
+for _ in $(seq 50); do sdd | grep -q 'd detach' && break; sleep 0.1; done
+sdd | grep -q 'Close oUI? This ends session' && sdd | grep -q 'y close oUI · d detach' \
+    || { echo "FAIL d on the last split asks to close oUI, offering detach" >&2; sdd >&2; exit 1; }
+echo "ok   d on the last split asks to close oUI, offering detach"
+tdd n
+tdd C-b d
+for _ in $(seq 50); do sdd | grep -q 'd detach' && break; sleep 0.1; done
+tdd d
+for _ in $(seq 50); do sdd | grep -q 'detached from session' && break; sleep 0.1; done
+sdd | grep -q 'detached from session' || { echo "FAIL d in the close prompt detaches" >&2; sdd >&2; exit 1; }
+"$bin" ls | grep -q '^dsplit:' || { echo "FAIL session survives detach from the close prompt" >&2; exit 1; }
+echo "ok   d in the close prompt detaches; session keeps running"
 
 echo "all e2e checks passed (temp dirs: $dir $sockdir)"

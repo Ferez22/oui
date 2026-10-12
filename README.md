@@ -22,8 +22,8 @@ Inside a tab, log in as usual (`claude` → `/login`, `railway login`, `gh auth 
 | `Ctrl-b ←↓↑→` or `h j k l` (or click a pane) | move focus between panes; Ctrl/Alt held with the arrow works too, and for 0.6 s more arrows keep moving without the prefix (`REPEAT` in the status bar) |
 | `Ctrl-b H J K L` or `Shift-←↓↑→` | move the nearest divider (repeats like focus) |
 | `Ctrl-b z` | zoom the focused pane |
-| `Ctrl-b x` / `&` | **close pane** / close tab (asks if a program other than the shell is still running, or if it's the last one: that ends oUI's session) |
-| `Ctrl-b d` | detach: asks first, then leaves oUI with your shells running (`oui attach` to come back) |
+| `Ctrl-b d` (or `x`) / `&` | **close the focused split** / close tab. Asks if a program other than the shell is still running. On the very last split it asks "Close oUI?": `y` ends the session, `d` detaches instead, `n` cancels |
+| `Ctrl-b D` | detach: asks first, then leaves oUI with your shells running (`oui attach` to come back) |
 | `Ctrl-b Ctrl-b` | send a literal Ctrl-b |
 | `Ctrl-b b` | show/hide the right panel: connected accounts for this tab's profile, sessions, profiles |
 | `Ctrl-b Tab` | focus the panel: `j`/`k` move, `Enter` logs in to the tool (new tab, same profile) / switches session / opens a tab in that profile, `Esc` (or `Ctrl-b Tab`) back |
@@ -31,7 +31,7 @@ Inside a tab, log in as usual (`claude` → `/login`, `railway login`, `gh auth 
 | `Ctrl-b ,` | rename the tab (shown as `1 name · profile`; empty clears) |
 | `Ctrl-b [` | copy mode: scroll back, search, select, copy (below) |
 
-The prefix and every key above can be changed in the config file (e.g. `d = "none"` to drop detach, or `q = "detach"`). An unbound key after the prefix is ignored entirely (never typed into the pane) and the status bar says so. Confirmations default to No: `y` confirms, anything else (`n`, `Esc`, `Enter`) cancels. Typing `exit` in the last shell ends the session without asking.
+The prefix and every key above can be changed in the config file (e.g. `D = "none"` to drop detach, or `q = "detach"`). An unbound key after the prefix is ignored entirely (never typed into the pane) and the status bar says so. Confirmations default to No: `y` confirms, anything else (`n`, `Esc`, `Enter`) cancels. Typing `exit` in the last shell ends the session without asking.
 
 The tab bar shows the `oUI` badge, each tab as a block (`1 name · profile`, the active one in its profile colour), a `+` button and the session name (click it for the session picker). With more tabs than fit, it scrolls to keep the active tab visible; `‹N` / `N›` count the hidden ones (click to go there).
 

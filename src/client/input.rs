@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn detach_and_close_ask_the_app() {
         let mut inp = Input::new("/tmp".into(), Keys::default(), None);
-        for (k, a) in [(b'd', Action::Detach), (b'x', Action::ClosePane), (b'&', Action::CloseTab)] {
+        for (k, a) in [(b'D', Action::Detach), (b'd', Action::ClosePane), (b'x', Action::ClosePane), (b'&', Action::CloseTab)] {
             inp.mode = Mode::Normal;
             assert!(inp.feed(&[2, k]).is_empty());
             assert_eq!(std::mem::take(&mut inp.ui), [UiEvent::Action(a)]);

@@ -66,7 +66,8 @@ pub fn draw(app: &App, f: &mut Frame) {
         }
         Some(super::Overlay::Rename(p)) => Some(super::picker::draw_prompt(f, p, &ostyle, "⏎ save · empty clears · esc cancel")),
         Some(super::Overlay::Confirm(c)) => {
-            super::picker::draw_confirm(f, &c.title, &c.text, "y yes · n / esc no", &ostyle);
+            let keys = if c.offer_detach { "y close oUI · d detach · n / esc cancel" } else { "y yes · n / esc no" };
+            super::picker::draw_confirm(f, &c.title, &c.text, keys, &ostyle);
             None
         }
         Some(super::Overlay::TmuxImport(o)) => {
@@ -372,7 +373,7 @@ impl StatusCtx<'_> {
 }
 
 /// Key hints from the actual bindings, e.g.
-/// `^b c tab · %/" split · ←↓↑→ focus · x close pane · z zoom · d detach`.
+/// `^b c tab · %/" split · ←↓↑→ focus · d close pane · z zoom · D detach`.
 pub fn hints(keys: &Keys) -> String {
     let key = |a: Action| keys.key_for(a).map(display_key);
     let mut parts = vec![display_key(&keys.prefix.notation)];
@@ -638,12 +639,12 @@ mod tests {
 
     #[test]
     fn hints_follow_bindings() {
-        assert_eq!(hints(&Keys::default()), "^b c tab · %/\" split · ←↓↑→ focus · x close pane · z zoom · d detach");
+        assert_eq!(hints(&Keys::default()), "^b c tab · %/\" split · ←↓↑→ focus · d close pane · z zoom · D detach");
         let c = Config::parse(
             "[keys]\nprefix = \"C-a\"\n[keys.bindings]\nv = \"split-right\"\n\"%\" = \"none\"\n\"|\" = \"none\"\nUp = \"none\"\nz = \"none\"",
             None,
         )
         .unwrap();
-        assert_eq!(hints(&c.keys), "^a c tab · v/\" split · ←/↓/k/→ focus · x close pane · d detach");
+        assert_eq!(hints(&c.keys), "^a c tab · v/\" split · ←/↓/k/→ focus · d close pane · D detach");
     }
 }
