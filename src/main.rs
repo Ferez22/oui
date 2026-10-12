@@ -2,6 +2,7 @@
 
 mod client;
 mod daemon;
+mod layout;
 mod profile;
 mod protocol;
 

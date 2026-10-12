@@ -18,7 +18,11 @@ Inside a tab, log in as usual (`claude` → `/login`, `railway login`, `gh auth 
 |---|---|
 | `Ctrl-b c` | new tab (pick profile) |
 | `Ctrl-b n` / `p` / `1-9` | next / previous / jump to tab |
-| `Ctrl-b x` | close tab |
+| `Ctrl-b %` or `\|` / `"` or `-` | split right / down (same profile as the tab) |
+| `Ctrl-b ←↓↑→` or `h j k l` | move focus between panes |
+| `Ctrl-b H J K L` | move the nearest divider |
+| `Ctrl-b z` | zoom the focused pane |
+| `Ctrl-b x` / `&` | close pane / close tab |
 | `Ctrl-b d` | detach (shells keep running) |
 | `Ctrl-b Ctrl-b` | send a literal Ctrl-b |
 

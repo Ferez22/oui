@@ -1,5 +1,6 @@
 //! Client ⇄ daemon messages over a unix socket: u32 length prefix + postcard.
 
+use crate::layout::{Dir, Rect};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::PathBuf;
@@ -25,7 +26,17 @@ pub enum ClientMsg {
     SelectTab(usize),
     NextTab,
     PrevTab,
+    /// Close every pane of the active tab.
     CloseTab,
+    /// Split the focused pane (right, or `down`); `cwd` is a fallback if the
+    /// focused shell's directory can't be read.
+    Split { down: bool, cwd: String },
+    Focus(Dir),
+    /// Move the divider nearest the focused pane.
+    ResizePane(Dir),
+    /// Toggle zoom: the focused pane fills the tab.
+    Zoom,
+    ClosePane,
     Detach,
     ListSessions,
     KillSession(String),
@@ -33,10 +44,20 @@ pub enum ClientMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PaneInfo {
+    pub id: u32,
+    /// Position inside the pane area (below the tab bar).
+    pub rect: Rect,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TabInfo {
-    pub pane: u32,
     pub profile: String,
     pub color: String,
+    /// Every pane of the tab; when zoomed only `focused` is visible (full area).
+    pub panes: Vec<PaneInfo>,
+    pub focused: u32,
+    pub zoomed: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

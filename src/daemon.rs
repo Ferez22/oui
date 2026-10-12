@@ -3,9 +3,12 @@
 //!
 //! Each pane has a PTY plus a vt100 emulator holding its screen, so a client
 //! attaching later gets the current screen as a snapshot, then live output.
+//! Each tab holds a layout tree of panes (all in the tab's profile); the
+//! daemon computes pane geometry and sizes every PTY to its rect.
 
+use crate::layout::{Axis, Node, Rect, neighbor};
 use crate::profile;
-use crate::protocol::{ClientMsg, Layout, ServerMsg, SessionInfo, TabInfo, read_msg, socket_path, write_msg};
+use crate::protocol::{ClientMsg, Layout, PaneInfo, ServerMsg, SessionInfo, TabInfo, read_msg, socket_path, write_msg};
 use anyhow::{Context, Result, anyhow, bail};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::HashMap;
@@ -21,23 +24,56 @@ enum Event {
     Exited(u32),
 }
 
+/// Fraction of a split moved per resize key.
+const RESIZE_STEP: f32 = 0.05;
+
 struct Pane {
     session: String,
-    profile: String,
-    color: String,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
     parser: vt100::Parser,
 }
 
+/// A tab is a profile boundary: every pane in it runs in `profile`.
+struct Tab {
+    /// `None` = system (no isolation).
+    profile: Option<String>,
+    color: String,
+    root: Node,
+    focused: u32,
+    zoomed: bool,
+}
+
+impl Tab {
+    /// Pane rects; when zoomed the focused pane covers the whole area.
+    fn geometry(&self, area: Rect) -> Vec<(u32, Rect)> {
+        let mut g = self.root.geometry(area);
+        if self.zoomed {
+            for (id, r) in &mut g {
+                if *id == self.focused {
+                    *r = area;
+                }
+            }
+        }
+        g
+    }
+}
+
 struct Session {
     name: String,
-    tabs: Vec<u32>,
+    tabs: Vec<Tab>,
     active: usize,
+    /// Size of the pane area (excludes the client's tab and status bars).
     rows: u16,
     cols: u16,
     last_used: u64,
+}
+
+impl Session {
+    fn area(&self) -> Rect {
+        Rect::new(0, 0, self.cols, self.rows)
+    }
 }
 
 struct Client {
@@ -190,10 +226,9 @@ impl State {
                 self.session_mut(&name)?.last_used = clock;
                 self.clients.insert(id, Client { session: name.clone(), tx: tx.clone() });
                 self.resize(&name, rows, cols)?;
-                self.send_layout(&name);
             }
             ClientMsg::Input(data) => {
-                let pane = self.active_pane(id)?;
+                let pane = self.focused_pane(id)?;
                 let p = self.panes.get_mut(&pane).ok_or_else(|| anyhow!("pane gone"))?;
                 p.writer.write_all(&data)?;
                 p.writer.flush()?;
@@ -212,10 +247,35 @@ impl State {
             ClientMsg::NextTab => self.select(id, |a, n| (a + 1) % n)?,
             ClientMsg::PrevTab => self.select(id, |a, n| (a + n - 1) % n)?,
             ClientMsg::CloseTab => {
-                let pane = self.active_pane(id)?;
-                if let Some(p) = self.panes.get_mut(&pane) {
-                    p.child.kill()?; // reader thread sees EOF → Exited → tab removed
+                let (_, leaves) = self.with_tab(id, |t, _| t.root.leaves())?;
+                for pane in leaves {
+                    self.kill_pane(pane);
                 }
+            }
+            ClientMsg::ClosePane => {
+                let pane = self.focused_pane(id)?;
+                self.kill_pane(pane); // reader thread sees EOF → Exited → pane removed
+            }
+            ClientMsg::Split { down, cwd } => self.split(id, if down { Axis::Vertical } else { Axis::Horizontal }, cwd)?,
+            ClientMsg::Focus(dir) => {
+                let (name, _) = self.with_tab(id, |t, area| {
+                    if let Some(n) = neighbor(&t.root.geometry(area), t.focused, dir) {
+                        t.focused = n;
+                        t.zoomed = false;
+                    }
+                })?;
+                self.relayout(&name, false)?;
+            }
+            ClientMsg::ResizePane(dir) => {
+                let (name, _) = self.with_tab(id, |t, _| {
+                    t.zoomed = false;
+                    t.root.resize(t.focused, dir, RESIZE_STEP)
+                })?;
+                self.relayout(&name, false)?;
+            }
+            ClientMsg::Zoom => {
+                let (name, _) = self.with_tab(id, |t, _| t.zoomed = !t.zoomed && matches!(t.root, Node::Split { .. }))?;
+                self.relayout(&name, false)?;
             }
             ClientMsg::Detach => {
                 if let Some(c) = self.clients.remove(&id) {
@@ -236,11 +296,9 @@ impl State {
                 tx.send(ServerMsg::Sessions(info))?;
             }
             ClientMsg::KillSession(name) => {
-                let tabs = self.session_mut(&name)?.tabs.clone();
-                for pane in tabs {
-                    if let Some(p) = self.panes.get_mut(&pane) {
-                        let _ = p.child.kill();
-                    }
+                let panes: Vec<u32> = self.session_mut(&name)?.tabs.iter().flat_map(|t| t.root.leaves()).collect();
+                for pane in panes {
+                    self.kill_pane(pane);
                 }
                 tx.send(ServerMsg::Ok)?;
             }
@@ -252,12 +310,10 @@ impl State {
         Ok(())
     }
 
-    fn spawn_tab(&mut self, session: &str, profile: Option<&str>, cwd: &str) -> Result<u32> {
+    /// Spawn a shell in `profile` with a `rows`×`cols` PTY. Returns its pane id and the profile colour.
+    fn spawn_pane(&mut self, session: &str, profile: Option<&str>, cwd: &str, rows: u16, cols: u16) -> Result<(u32, String)> {
         let env = profile::spawn_env(profile)?;
-        let (rows, cols) = {
-            let s = self.session_mut(session)?;
-            (s.rows, s.cols)
-        };
+        let (rows, cols) = (rows.max(1), cols.max(1));
         let pair = native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let mut cmd = CommandBuilder::new(&shell);
@@ -297,38 +353,97 @@ impl State {
 
         self.panes.insert(id, Pane {
             session: session.into(),
-            profile: profile.unwrap_or(profile::SYSTEM).into(),
-            color: env.color,
             master: pair.master,
             writer,
             child,
             parser: vt100::Parser::new(rows, cols, 0),
         });
+        Ok((id, env.color))
+    }
+
+    fn spawn_tab(&mut self, session: &str, profile: Option<&str>, cwd: &str) -> Result<u32> {
+        let (rows, cols) = {
+            let s = self.session_mut(session)?;
+            (s.rows, s.cols)
+        };
+        let (id, color) = self.spawn_pane(session, profile, cwd, rows, cols)?;
         let s = self.session_mut(session)?;
-        s.tabs.push(id);
+        s.tabs.push(Tab { profile: profile.map(Into::into), color, root: Node::Leaf(id), focused: id, zoomed: false });
         s.active = s.tabs.len() - 1;
         Ok(id)
     }
 
-    /// Remove an exited pane. Returns true when the daemon has nothing left.
+    /// Split the focused pane of the client's active tab. The new shell runs in
+    /// the tab's profile and starts in the focused shell's directory.
+    fn split(&mut self, client: u64, axis: Axis, fallback_cwd: String) -> Result<()> {
+        let new = self.next_pane;
+        let (name, (focused, profile, rect)) = self.with_tab(client, |t, area| {
+            let mut root = t.root.clone();
+            root.split(t.focused, new, axis);
+            let rect = root.geometry(area).into_iter().find(|(id, _)| *id == new).map(|(_, r)| r).unwrap_or(area);
+            (t.focused, t.profile.clone(), rect)
+        })?;
+        let cwd = self
+            .panes
+            .get(&focused)
+            .and_then(|p| p.child.process_id())
+            .and_then(pid_cwd)
+            .unwrap_or(fallback_cwd);
+        let (id, _) = self.spawn_pane(&name, profile.as_deref(), &cwd, rect.rows, rect.cols)?;
+        self.with_tab(client, |t, _| {
+            t.root.split(focused, id, axis);
+            t.focused = id;
+            t.zoomed = false;
+        })?;
+        self.relayout(&name, false)?;
+        self.send_snapshot(id);
+        Ok(())
+    }
+
+    fn kill_pane(&mut self, id: u32) {
+        if let Some(p) = self.panes.get_mut(&id) {
+            let _ = p.child.kill();
+        }
+    }
+
+    /// Remove an exited pane, collapsing its tab's layout (or closing the tab).
+    /// Returns true when the daemon has nothing left.
     fn remove_pane(&mut self, id: u32) -> bool {
         let Some(mut pane) = self.panes.remove(&id) else { return false };
         let _ = pane.child.try_wait();
         let name = pane.session;
-        if let Some(s) = self.sessions.iter_mut().find(|s| s.name == name) {
-            s.tabs.retain(|&t| t != id);
-            s.active = s.active.min(s.tabs.len().saturating_sub(1));
-            if s.tabs.is_empty() {
-                self.sessions.retain(|s| s.name != name);
-                let gone: Vec<u64> = self.clients.iter().filter(|(_, c)| c.session == name).map(|(k, _)| *k).collect();
-                for k in gone {
-                    if let Some(c) = self.clients.remove(&k) {
-                        let _ = c.tx.send(ServerMsg::Exit(format!("session '{name}' ended")));
+        let Some(s) = self.sessions.iter_mut().find(|s| s.name == name) else { return self.sessions.is_empty() };
+        if let Some(ti) = s.tabs.iter().position(|t| t.root.contains(id)) {
+            let t = &mut s.tabs[ti];
+            match t.root.remove(id) {
+                Some(next) => {
+                    if t.focused == id {
+                        t.focused = next;
+                        t.zoomed = false;
+                    }
+                    if matches!(t.root, Node::Leaf(_)) {
+                        t.zoomed = false;
                     }
                 }
-            } else {
-                self.send_layout(&name);
+                None => {
+                    s.tabs.remove(ti);
+                    if ti < s.active {
+                        s.active -= 1;
+                    }
+                    s.active = s.active.min(s.tabs.len().saturating_sub(1));
+                }
             }
+        }
+        if s.tabs.is_empty() {
+            self.sessions.retain(|s| s.name != name);
+            let gone: Vec<u64> = self.clients.iter().filter(|(_, c)| c.session == name).map(|(k, _)| *k).collect();
+            for k in gone {
+                if let Some(c) = self.clients.remove(&k) {
+                    let _ = c.tx.send(ServerMsg::Exit(format!("session '{name}' ended")));
+                }
+            }
+        } else {
+            let _ = self.relayout(&name, false);
         }
         self.sessions.is_empty()
     }
@@ -346,18 +461,32 @@ impl State {
     /// Latest attaching/resizing client sets the session size (tmux "latest").
     /// Every client then gets fresh snapshots at that size.
     fn resize(&mut self, name: &str, rows: u16, cols: u16) -> Result<()> {
-        let (rows, cols) = (rows.max(1), cols.max(1));
         let s = self.session_mut(name)?;
-        s.rows = rows;
-        s.cols = cols;
-        let tabs = s.tabs.clone();
-        for id in &tabs {
-            if let Some(p) = self.panes.get_mut(id) {
+        s.rows = rows.max(1);
+        s.cols = cols.max(1);
+        self.relayout(name, true)
+    }
+
+    /// Size every pane's PTY and screen to its rect, then send the layout and
+    /// snapshots of resized panes (all panes with `snapshot_all`).
+    fn relayout(&mut self, name: &str, snapshot_all: bool) -> Result<()> {
+        let s = self.sessions.iter().find(|s| s.name == name).ok_or_else(|| anyhow!("no session named '{name}'"))?;
+        let area = s.area();
+        let geometry: Vec<_> = s.tabs.iter().flat_map(|t| t.geometry(area)).collect();
+        let mut changed = Vec::new();
+        for (id, r) in geometry {
+            let Some(p) = self.panes.get_mut(&id) else { continue };
+            let (rows, cols) = (r.rows.max(1), r.cols.max(1));
+            if p.parser.screen().size() != (rows, cols) {
                 p.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
                 p.parser.screen_mut().set_size(rows, cols);
+                changed.push(id);
+            } else if snapshot_all {
+                changed.push(id);
             }
         }
-        for id in tabs {
+        self.send_layout(name);
+        for id in changed {
             self.send_snapshot(id);
         }
         Ok(())
@@ -374,13 +503,20 @@ impl State {
 
     fn send_layout(&self, name: &str) {
         let Some(s) = self.sessions.iter().find(|s| s.name == name) else { return };
+        let area = s.area();
         let layout = Layout {
             session: s.name.clone(),
             active: s.active,
             tabs: s
                 .tabs
                 .iter()
-                .filter_map(|id| self.panes.get(id).map(|p| TabInfo { pane: *id, profile: p.profile.clone(), color: p.color.clone() }))
+                .map(|t| TabInfo {
+                    profile: t.profile.clone().unwrap_or_else(|| profile::SYSTEM.into()),
+                    color: t.color.clone(),
+                    panes: t.geometry(area).into_iter().map(|(id, rect)| PaneInfo { id, rect }).collect(),
+                    focused: t.focused,
+                    zoomed: t.zoomed,
+                })
                 .collect(),
         };
         self.send_to_session(name, || ServerMsg::Layout(layout.clone()));
@@ -400,9 +536,39 @@ impl State {
         self.sessions.iter_mut().find(|s| s.name == name).ok_or_else(|| anyhow!("no session named '{name}'"))
     }
 
-    fn active_pane(&self, id: u64) -> Result<u32> {
-        let name = self.client_session(id)?;
-        let s = self.sessions.iter().find(|s| s.name == name).ok_or_else(|| anyhow!("session gone"))?;
-        s.tabs.get(s.active).copied().ok_or_else(|| anyhow!("no tabs"))
+    /// Run `f` on the client's active tab (with the session's pane area).
+    /// Returns the session name and `f`'s result.
+    fn with_tab<R>(&mut self, client: u64, f: impl FnOnce(&mut Tab, Rect) -> R) -> Result<(String, R)> {
+        let name = self.client_session(client)?;
+        let s = self.session_mut(&name)?;
+        let area = s.area();
+        let tab = s.tabs.get_mut(s.active).ok_or_else(|| anyhow!("no tabs"))?;
+        Ok((name, f(tab, area)))
     }
+
+    fn focused_pane(&mut self, client: u64) -> Result<u32> {
+        Ok(self.with_tab(client, |t, _| t.focused)?.1)
+    }
+}
+
+/// Current directory of process `pid`, so a split starts where the focused shell is.
+#[cfg(target_os = "macos")]
+fn pid_cwd(pid: u32) -> Option<String> {
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    // SAFETY: proc_vnodepathinfo is plain data; zeroed is a valid value.
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    // SAFETY: the buffer is a writable proc_vnodepathinfo of `size` bytes.
+    let n = unsafe {
+        libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDVNODEPATHINFO, 0, (&raw mut info).cast(), size)
+    };
+    if n != size {
+        return None;
+    }
+    let path: Vec<u8> = info.pvi_cdir.vip_path.as_flattened().iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+    String::from_utf8(path).ok().filter(|p| !p.is_empty())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pid_cwd(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok().map(|p| p.to_string_lossy().into_owned())
 }
