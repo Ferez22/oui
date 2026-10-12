@@ -97,10 +97,10 @@ impl Env {
         Env { vars, macos: cfg!(target_os = "macos") }
     }
 
-    /// Environment of a shell in `profile` (`None` = system), as `profile::spawn_env` builds it.
+    /// Environment of a shell in `profile` (`None` = system), as `profile::env_for` builds it.
     pub fn for_profile(profile: Option<&str>) -> Result<Self> {
         let mut vars: HashMap<String, String> = std::env::vars().collect();
-        let spawn = profile::spawn_env(profile)?;
+        let spawn = profile::env_for(profile)?;
         for k in &spawn.remove {
             vars.remove(k);
         }

@@ -25,10 +25,15 @@ const SHARED_ALLOWLIST: &[&str] = &[
     ".config/nvim", ".config/helix",
 ];
 
-/// Variables that would override per-profile logins.
+/// Variables that would override per-profile logins: tokens, and paths that
+/// point tools back at the real HOME's credential files.
 const CREDENTIAL_VARS: &[&str] = &[
     "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "RAILWAY_TOKEN", "RAILWAY_API_TOKEN",
-    "GH_TOKEN", "GITHUB_TOKEN", "VERCEL_TOKEN",
+    "GH_TOKEN", "GITHUB_TOKEN", "VERCEL_TOKEN", "NPM_TOKEN", "FLY_ACCESS_TOKEN",
+    "SUPABASE_ACCESS_TOKEN", "STRIPE_API_KEY", "NETLIFY_AUTH_TOKEN",
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE",
+    "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE", "DOCKER_CONFIG",
+    "NPM_CONFIG_USERCONFIG", "GIT_CONFIG_GLOBAL",
 ];
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -145,6 +150,15 @@ pub struct SpawnEnv {
 }
 
 pub fn spawn_env(profile: Option<&str>) -> Result<SpawnEnv> {
+    if let Some(name) = profile {
+        let (dir, cfg) = load(name)?;
+        sync_shared(&dir.join("home"), &cfg)?;
+    }
+    env_for(profile)
+}
+
+/// Like `spawn_env` but read-only: doesn't refresh shared dotfile links.
+pub fn env_for(profile: Option<&str>) -> Result<SpawnEnv> {
     // Our pane emulator speaks xterm; a TERM every server knows also keeps
     // nano/vim working over ssh.
     let mut set = vec![("TERM".to_string(), "xterm-256color".to_string())];
@@ -154,7 +168,6 @@ pub fn spawn_env(profile: Option<&str>) -> Result<SpawnEnv> {
     };
     let (dir, cfg) = load(name)?;
     let home = dir.join("home");
-    sync_shared(&home, &cfg)?;
     let h = |rel: &str| home.join(rel).to_string_lossy().into_owned();
     set.extend([
         ("OUI_PROFILE".into(), name.into()),
