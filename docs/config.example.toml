@@ -1,0 +1,93 @@
+# oUI config: ~/.oui/config.toml
+# Every key is optional; missing keys use the defaults shown here.
+
+[general]
+# Profile for new sessions and tabs when none is given (unset = system).
+# default_profile = "work"
+# Shell to run in panes (default: $SHELL).
+# shell = "/bin/zsh"
+# Lines of scrollback kept per pane.
+scrollback = 10000
+# Mouse support (click tabs/panes, scroll).
+mouse = true
+
+[keys]
+# Prefix key. Notation: C- (Ctrl), M- (Alt/Meta), S- (Shift), then a character
+# or a key name: Enter Tab BTab Esc Space BSpace Up Down Left Right Home End
+# PageUp PageDown Insert Delete F1-F12. Pressing the prefix twice sends it
+# to the pane (send-prefix).
+prefix = "C-b"
+
+# Keys pressed after the prefix. Entries here are layered over the defaults;
+# use "none" to remove a default binding. Actions: new-tab next-tab prev-tab
+# select-tab-1..9 close-pane close-tab detach split-right split-down
+# focus-left/right/up/down resize-left/right/up/down zoom toggle-panel
+# copy-mode command-palette send-prefix rename-tab session-picker
+[keys.bindings]
+c = "new-tab"
+n = "next-tab"
+p = "prev-tab"
+1 = "select-tab-1"
+2 = "select-tab-2"
+3 = "select-tab-3"
+4 = "select-tab-4"
+5 = "select-tab-5"
+6 = "select-tab-6"
+7 = "select-tab-7"
+8 = "select-tab-8"
+9 = "select-tab-9"
+x = "close-pane"
+"&" = "close-tab"
+d = "detach"
+"%" = "split-right"
+"|" = "split-right"
+'"' = "split-down"
+- = "split-down"
+Left = "focus-left"
+Right = "focus-right"
+Up = "focus-up"
+Down = "focus-down"
+h = "focus-left"
+l = "focus-right"
+k = "focus-up"
+j = "focus-down"
+H = "resize-left"
+L = "resize-right"
+K = "resize-up"
+J = "resize-down"
+z = "zoom"
+b = "toggle-panel"
+"[" = "copy-mode"
+s = "session-picker"
+"," = "rename-tab"
+
+# Colours: a name ("green", "light-blue", "dark-gray"), "#rrggbb", a 0-255 index,
+# "default" (terminal default) or "profile" (the pane's profile colour).
+# Shorthand: theme = "nord" (built-in: default, nord, light; or ~/.oui/themes/<name>.toml,
+# which holds the same keys as below and may set its own built-in base).
+[theme]
+base = "default"
+# Overrides on top of the base theme (values shown are the default theme's):
+# tab_bar_bg = "default"       # Tab bar background
+# tab_bar_fg = "gray"          # Tab bar text
+# tab_active_bg = "profile"    # Active tab background
+# tab_active_fg = "black"      # Active tab text
+# status_bg = 236              # Status bar background
+# status_fg = "gray"           # Status bar text
+# border = 240                 # Pane borders
+# focused_border = "profile"   # Border of the focused pane
+# panel_bg = 235               # Right panel background
+# panel_fg = "gray"            # Right panel text
+# accent = "yellow"            # Highlights (prefix indicator, selection)
+
+# Status bar segments: session profile mode hints clock cwd hostname tabs-count,
+# or custom text: { text = "…" }
+[status]
+left = ["mode", "session", "profile"]
+right = ["hints", "clock"]
+
+# Right panel (toggle with the toggle-panel key). Widgets: accounts sessions profiles
+[panel]
+visible = false
+width = 32
+widgets = ["accounts", "sessions", "profiles"]
