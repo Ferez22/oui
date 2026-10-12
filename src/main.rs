@@ -1,5 +1,6 @@
 //! oUI: terminal workspace with per-profile isolated logins and tmux-style sessions.
 
+mod accounts;
 mod client;
 mod daemon;
 mod profile;
@@ -51,6 +52,8 @@ enum Cmd {
     },
     /// Print the environment a profile's shells get
     Env { name: String },
+    /// Show which CLI tools are logged in for a profile (default: system)
+    Accounts { profile: Option<String> },
     /// Run the server (started automatically)
     #[command(hide = true)]
     Daemon,
@@ -122,6 +125,7 @@ fn main() -> Result<()> {
             exec_in(&name, &shell, &["-l".into()])
         }
         Some(Cmd::Run { name, cmd }) => exec_in(&name, &cmd[0], &cmd[1..]),
+        Some(Cmd::Accounts { profile }) => accounts::print_table(profile.as_deref()),
         Some(Cmd::Env { name }) => {
             for (k, v) in profile::spawn_env(Some(&name))?.set {
                 println!("{k}={v}");
