@@ -31,6 +31,9 @@ Crates: `portable-pty` (spawn shells), `alacritty_terminal` or `vt100` (terminal
 
 The daemon keeps shells alive when clients disconnect (tmux model). Clients are thin.
 
+- **Protocol:** every frame starts with a magic and a protocol version (`oui --version`); client and daemon refuse other versions instead of misreading them, and the client tells the user to run `oui kill-server`, which also stops older daemons.
+- **Robustness:** a pane's input is written by its own thread through a bounded queue (4 MiB; a pane that stops reading gets further input dropped with a `pane is not reading input` message), so no pane can block other sessions. Panes are at least 2 columns × 1 row (splits below that are refused); emulator panics are contained and reset only that pane's screen.
+
 ## Profiles & login isolation
 
 Layout:

@@ -733,4 +733,111 @@ sdd | grep -q 'detached from session' || { echo "FAIL d in the close prompt deta
 "$bin" ls | grep -q '^dsplit:' || { echo "FAIL session survives detach from the close prompt" >&2; exit 1; }
 echo "ok   d in the close prompt detaches; session keeps running"
 
+# wait_in <tmux session> <grep -E pattern> <what> [tenths of a second]
+wait_in() {
+    for _ in $(seq "${4:-50}"); do
+        if tmux -L "$tm" capture-pane -p -t "$1" | grep -qE -- "$2"; then
+            echo "ok   $3"
+            return
+        fi
+        sleep 0.1
+    done
+    echo "FAIL $3 (pattern: $2)" >&2
+    tmux -L "$tm" capture-pane -p -t "$1" >&2
+    exit 1
+}
+keys() { tmux -L "$tm" send-keys -t "$@"; }
+
+# --- Minimum pane size: splits stop at 2 columns; a wide character printed in
+# the narrowest pane can't break the emulator (vt100 panics on 1 column).
+t new -d -s nw -x 60 -y 20 "'$bin' new -s narrow; sleep 120"
+wait_in nw '^\$' "shell prompt (60 columns)"
+for _ in $(seq 12); do
+    keys nw C-b %
+    sleep 0.3
+    tmux -L "$tm" capture-pane -p -t nw | grep -q 'no room to split' && break
+done
+wait_in nw 'no room to split: panes need at least 2 columns' "splitting stops at the minimum pane size"
+keys nw "printf '\\344\\270\\255\\360\\237\\230\\200\\n'" Enter
+sleep 0.5
+"$bin" ls | grep -q '^narrow: 1 tab' || fail "daemon answers after a wide character in the narrowest pane"
+echo "ok   daemon answers after a wide character in the narrowest pane"
+keys nw C-b z
+keys nw 'echo WIDE-$((6*7))' Enter
+wait_in nw '^WIDE-42' "the narrow pane still works (zoomed)"
+if grep -q 'panicked' "$OUI_HOME/daemon.log"; then fail "no emulator panic in daemon.log"; fi
+echo "ok   no emulator panic in daemon.log"
+keys nw C-b D y
+wait_in nw 'detached from session' "detach"
+
+# --- A pane that never reads its input must not freeze other sessions.
+{ yes 'oUI paste test 0123456789 abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ' || true; } | head -c 262144 >"$dir/paste.txt"
+t new -d -s qa -x 100 -y 20 "'$bin' new -s stuck; sleep 300"
+t new -d -s qb -x 100 -y 20 "'$bin' new -s free; sleep 300"
+wait_in qa '^\$' "session A prompt"
+wait_in qb '^\$' "session B prompt"
+t load-buffer "$dir/paste.txt"
+n=0
+for variant in 'sleep 600' 'stty raw -echo; sleep 600'; do
+    n=$((n + 1))
+    keys qa "$variant" Enter
+    sleep 0.5
+    t paste-buffer -t qa
+    sleep 0.5
+    keys qb "clear; echo FREE-\$((6*7))-$n" Enter
+    wait_in qb "^FREE-42-$n" "session B echoes within 2 s while A ($variant) ignores 256 KiB of input" 20
+    for _ in $(seq 20); do "$bin" ls >/dev/null && break; sleep 0.1; done
+    "$bin" ls | grep -q '^stuck:' || fail "ls answers"
+    echo "ok   ls answers"
+    # A's own session still works too: a new tab opens and runs.
+    keys qa C-b c
+    sleep 0.3
+    keys qa Enter
+    keys qa 'echo NEWTAB-$((6*7))' Enter
+    wait_in qa '^NEWTAB-42' "session A gets a new working tab" 20
+done
+keys qb C-b D y
+wait_in qb 'detached from session' "detach B"
+
+# --- Protocol version: `oui --version`, an old (unversioned) server.
+"$bin" --version | grep -qE '^oui [0-9.]+ \(protocol [0-9]+\)$' || fail "oui --version shows the protocol"
+echo "ok   oui --version: $("$bin" --version)"
+if command -v python3 >/dev/null; then
+    # A stand-in for an oUI server from before versioning: it reads a u32
+    # length, drops connections whose length is over 16 MiB, and answers the
+    # old KillServer frame (length 1, variant 17) with Ok (variant 6).
+    fake=$sockdir/old.sock
+    cat >"$dir/oldserver.py" <<'PY'
+import os, socket, struct, sys
+path, log = sys.argv[1], sys.argv[2]
+srv = socket.socket(socket.AF_UNIX)
+srv.bind(path)
+srv.listen(4)
+with open(log, "a") as out:
+    while True:
+        c, _ = srv.accept()
+        (n,) = struct.unpack(">I", c.recv(4, socket.MSG_WAITALL))
+        if n > 16 * 1024 * 1024:
+            out.write("rejected frame\n"); out.flush(); c.close(); continue
+        body = c.recv(n, socket.MSG_WAITALL)
+        out.write("frame %s\n" % body.hex()); out.flush()
+        if body == b"\x11":
+            c.sendall(b"\x00\x00\x00\x01\x06"); c.close(); os.unlink(path); break
+        c.close()
+PY
+    python3 -I "$dir/oldserver.py" "$fake" "$dir/oldserver.log" &
+    for _ in $(seq 50); do [ -S "$fake" ] && break; sleep 0.1; done
+    if out=$(OUI_SOCKET=$fake "$bin" ls 2>&1); then fail "ls against an old server fails"; fi
+    echo "$out" | grep -q 'oUI was updated but an older background server is still running. Run `oui kill-server` (this closes your sessions) and start oui again.' \
+        || fail "friendly message for an old server: $out"
+    echo "ok   old server: friendly message, non-zero exit"
+    grep -q '^frame' "$dir/oldserver.log" && fail "old server must not get a frame it decodes"
+    grep -q '^rejected frame' "$dir/oldserver.log" || fail "old server rejected the new frame"
+    echo "ok   old server rejects the new frame without acting on it"
+    OUI_SOCKET=$fake "$bin" kill-server | grep -q 'stopped the older oUI server' || fail "kill-server stops an old server"
+    grep -q '^frame 11$' "$dir/oldserver.log" || fail "kill-server sent the old KillServer frame"
+    wait
+    echo "ok   kill-server stops an old server (old KillServer frame)"
+fi
+
 echo "all e2e checks passed (temp dirs: $dir $sockdir)"

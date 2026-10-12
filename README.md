@@ -203,7 +203,9 @@ cp -R ~/.claude/projects/<folder-name>/. ~/.oui/profiles/<profile>/home/.claude/
 
 **"I'm stuck in a split."** Prefix then an arrow key moves between splits, or just click the other split. Prefix then `d` closes the current one.
 
-**"Something looks broken after an update."** Run `oui kill-server` and start `oui` again. The background server keeps running the old version until you do.
+**"Something looks broken after an update."** Run `oui kill-server` and start `oui` again. The background server keeps running the old version until you do. If the versions can't talk to each other, `oui` says so ("oUI was updated but an older background server is still running") and does nothing else; `oui kill-server` still stops the old server. `oui --version` shows the version and protocol.
+
+**"Splitting says no room to split."** Every split needs at least 2 columns and 1 row; close a split or make the window bigger.
 
 **"`nano`/`vim` look wrong over ssh."** oUI uses `TERM=xterm-256color`, which every server knows. If you changed `TERM` yourself, set it back.
 

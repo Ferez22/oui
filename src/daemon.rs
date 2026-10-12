@@ -6,9 +6,12 @@
 //! Each tab holds a layout tree of panes (all in the tab's profile); the
 //! daemon computes pane geometry and sizes every PTY to its rect.
 
-use crate::layout::{Axis, Node, Rect, neighbor};
-use crate::profile;
-use crate::protocol::{ClientMsg, Layout, PaneInfo, ServerMsg, SessionInfo, TabInfo, read_msg, socket_path, write_msg};
+use crate::layout::{Axis, MIN_COLS, MIN_ROWS, Node, Rect, neighbor};
+use crate::profile::{self, SpawnEnv};
+use crate::protocol::{
+    ClientMsg, Frame, Layout, Mismatch, PaneInfo, ServerMsg, SessionInfo, TabInfo, VERSION, legacy_exit, read_frame,
+    socket_path, write_msg,
+};
 use crate::workspace::{PaneSpec, TabSpec, WorkspaceSpec};
 use anyhow::{Context, Result, anyhow, bail};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -16,24 +19,86 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 enum Event {
     Output(u32, Vec<u8>),
     Exited(u32),
+    /// `KILL_GRACE` after a SIGHUP: SIGKILL the pane's shell if still running.
+    Escalate(u32),
+    /// `KILL_GRACE` after `shutdown`: SIGKILL what's left and exit.
+    Exit,
 }
 
 /// Fraction of a split moved per resize key.
 const RESIZE_STEP: f32 = 0.05;
 
+/// How long a closed pane's shell gets between SIGHUP and SIGKILL.
+const KILL_GRACE: Duration = Duration::from_millis(250);
+
+/// Most input bytes queued for a pane whose program isn't reading; more is
+/// dropped (with a message) instead of blocking anything.
+const INPUT_QUEUE_MAX: usize = 4 * 1024 * 1024;
+
+/// Written into a pane whose emulator had to be reset.
+const RESET_NOTICE: &[u8] = b"\x1b[33moUI \xe2\x96\xb8 terminal reset after an emulator error\x1b[0m\r\n";
+
 struct Pane {
     session: String,
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    input: PaneInput,
     child: Box<dyn Child + Send + Sync>,
     parser: vt100::Parser<Clip>,
+}
+
+/// Input for a pane's PTY, written by a dedicated thread: a program that
+/// stops reading blocks only that thread, never the state lock. Dropping it
+/// (pane removed) ends the thread once the queue is written.
+struct PaneInput {
+    tx: mpsc::Sender<Vec<u8>>,
+    queued: Arc<AtomicUsize>,
+    max: usize,
+}
+
+impl PaneInput {
+    fn new(mut writer: Box<dyn Write + Send>, max: usize) -> PaneInput {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let q = queued.clone();
+        std::thread::spawn(move || {
+            for chunk in rx {
+                let ok = writer.write_all(&chunk).and_then(|_| writer.flush()).is_ok();
+                q.fetch_sub(chunk.len(), Ordering::Relaxed);
+                if !ok {
+                    break;
+                }
+            }
+        });
+        PaneInput { tx, queued, max }
+    }
+
+    /// Queue `data`; never blocks. Fails when the pane's queue is full.
+    fn send(&self, data: Vec<u8>) -> Result<()> {
+        let n = data.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let queued = self.queued.load(Ordering::Relaxed);
+        if queued > 0 && queued + n > self.max {
+            bail!("pane is not reading input ({} KiB waiting); dropped {n} bytes", queued / 1024);
+        }
+        self.queued.fetch_add(n, Ordering::Relaxed);
+        if self.tx.send(data).is_err() {
+            self.queued.fetch_sub(n, Ordering::Relaxed);
+            bail!("pane is closing");
+        }
+        Ok(())
+    }
 }
 
 /// Largest OSC 52 payload (base64) forwarded from a pane to clients.
@@ -110,9 +175,19 @@ struct State {
     /// `general.shell` (else `$SHELL`) and `general.scrollback`, read at startup.
     shell: Option<String>,
     scrollback: usize,
+    /// Profile environments prepared outside the lock for the message being
+    /// handled (`prepare_envs`); `spawn_pane` falls back to preparing its own.
+    prepared: HashMap<Option<String>, Result<SpawnEnv, String>>,
+    shutting_down: bool,
 }
 
 type Shared = Arc<Mutex<State>>;
+
+/// Lock the state even if a panic poisoned it: one failed request must never
+/// wedge every session.
+fn lock(state: &Shared) -> MutexGuard<'_, State> {
+    state.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 pub fn run() -> Result<()> {
     tokio::runtime::Runtime::new()?.block_on(serve())
@@ -146,28 +221,19 @@ async fn serve() -> Result<()> {
         events: events_tx,
         shell: config.general.shell,
         scrollback: config.general.scrollback,
+        prepared: HashMap::new(),
+        shutting_down: false,
     }));
+    eprintln!("oUI server {VERSION} started (pid {})", std::process::id());
 
     let pump_state = state.clone();
     tokio::spawn(async move {
         while let Some(ev) = events_rx.recv().await {
-            let mut st = pump_state.lock().unwrap();
-            match ev {
-                Event::Output(id, data) => {
-                    let Some(pane) = st.panes.get_mut(&id) else { continue };
-                    pane.parser.process(&data);
-                    let clips = std::mem::take(&mut pane.parser.callbacks_mut().0);
-                    let session = pane.session.clone();
-                    st.send_to_session(&session, || ServerMsg::Output { pane: id, data: data.clone() });
-                    for c in clips {
-                        st.send_to_session(&session, || ServerMsg::Clipboard(c.clone()));
-                    }
-                }
-                Event::Exited(id) => {
-                    if st.remove_pane(id) {
-                        shutdown(&mut st);
-                    }
-                }
+            let mut st = lock(&pump_state);
+            // Never let one bad event stop output for every pane.
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| st.on_event(ev)));
+            if r.is_err() {
+                eprintln!("event handler panicked; continuing");
             }
         }
     });
@@ -182,26 +248,46 @@ async fn serve() -> Result<()> {
             if let Err(e) = handle_client(st.clone(), id, stream).await {
                 eprintln!("client {id}: {e:#}");
             }
-            st.lock().unwrap().clients.remove(&id);
+            lock(&st).clients.remove(&id);
         });
     }
 }
 
-/// Exit the daemon: tell clients, remove the socket.
+/// Exit the daemon: tell clients, remove the socket, SIGHUP every shell;
+/// `KILL_GRACE` later (`Event::Exit`) SIGKILL the rest and exit.
 fn shutdown(st: &mut State) {
+    if st.shutting_down {
+        return;
+    }
+    st.shutting_down = true;
     for c in st.clients.values() {
         let _ = c.tx.send(ServerMsg::Exit("oUI server exited".into()));
     }
     for pane in st.panes.values_mut() {
-        let _ = pane.child.kill();
+        signal(&mut *pane.child, libc::SIGHUP);
     }
     if let Ok(p) = socket_path() {
         let _ = std::fs::remove_file(p);
     }
-    tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let events = st.events.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(KILL_GRACE);
+        let _ = events.send(Event::Exit);
+        // Whatever happens to the event loop, don't linger.
+        std::thread::sleep(Duration::from_secs(2));
         std::process::exit(0);
     });
+}
+
+/// Send `sig` to a child that hasn't been reaped yet (so its pid can't
+/// belong to another process by now). Never blocks.
+fn signal(child: &mut (dyn Child + Send + Sync), sig: libc::c_int) -> bool {
+    if !matches!(child.try_wait(), Ok(None)) {
+        return false;
+    }
+    let Some(pid) = child.process_id() else { return false };
+    // SAFETY: plain kill(2) on our own unreaped child.
+    unsafe { libc::kill(pid as libc::pid_t, sig) == 0 }
 }
 
 async fn handle_client(state: Shared, id: u64, stream: UnixStream) -> Result<()> {
@@ -214,21 +300,88 @@ async fn handle_client(state: Shared, id: u64, stream: UnixStream) -> Result<()>
                 break;
             }
         }
+        wr
     });
 
+    let mut legacy = false;
     loop {
-        let msg: ClientMsg = match read_msg(&mut rd).await {
-            Ok(m) => m,
-            Err(_) => break, // client gone
+        let msg: ClientMsg = match read_frame(&mut rd).await {
+            Ok(Frame::Msg(m)) => m,
+            Ok(Frame::Kill) => {
+                eprintln!("client {id}: kill frame; shutting down");
+                shutdown(&mut lock(&state));
+                break;
+            }
+            Err(e) => {
+                match e.downcast_ref::<Mismatch>() {
+                    Some(Mismatch(None)) => legacy = true,
+                    Some(Mismatch(Some(v))) => {
+                        eprintln!("client {id}: {e}");
+                        // Our header tells the client which version we speak.
+                        let _ = tx.send(ServerMsg::Error(format!(
+                            "this oUI server is {VERSION}; the client speaks protocol {v}"
+                        )));
+                    }
+                    None => {} // client gone
+                }
+                break;
+            }
         };
-        let mut st = state.lock().unwrap();
-        if let Err(e) = st.handle(id, msg, &tx) {
+        if let ClientMsg::Hello = msg {
+            tx.send(ServerMsg::Hello(VERSION.into()))?;
+            continue;
+        }
+        // Profile setup can wait on the keychain: do it before taking the lock.
+        let profiles = lock(&state).spawn_profiles(id, &msg);
+        let prepared = prepare_envs(profiles).await;
+        let mut st = lock(&state);
+        st.prepared = prepared;
+        let r = st.handle(id, msg, &tx);
+        st.prepared.clear();
+        drop(st);
+        if let Err(e) = r {
             let _ = tx.send(ServerMsg::Error(format!("{e:#}")));
         }
     }
     drop(tx);
-    let _ = writer.await;
+    if let Ok(mut wr) = writer.await
+        && legacy
+    {
+        eprintln!("client {id}: old oUI client (unversioned protocol); told it to update");
+        let reason = format!(
+            "this oui is older than the running oUI server ({VERSION}); use the updated oui, \
+             or run `oui kill-server` with it (this closes your sessions)"
+        );
+        let _ = wr.write_all(&legacy_exit(&reason)).await;
+    }
     Ok(())
+}
+
+/// `spawn_env` for each profile (keychain unlock may wait up to
+/// `SPAWN_KEYCHAIN_WAIT`), off the async workers and outside the state lock;
+/// one preparation at a time.
+async fn prepare_envs(profiles: Vec<Option<String>>) -> HashMap<Option<String>, Result<SpawnEnv, String>> {
+    if profiles.is_empty() {
+        return HashMap::new();
+    }
+    tokio::task::spawn_blocking(move || {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = HashMap::new();
+        for p in profiles {
+            if let std::collections::hash_map::Entry::Vacant(slot) = out.entry(p) {
+                let env = profile::spawn_env(slot.key().as_deref()).map_err(|e| format!("{e:#}"));
+                slot.insert(env);
+            }
+        }
+        out
+    })
+    .await
+    .unwrap_or_default()
+}
+
+fn clone_env(e: &SpawnEnv) -> SpawnEnv {
+    SpawnEnv { set: e.set.clone(), remove: e.remove.clone(), color: e.color.clone(), warning: e.warning.clone() }
 }
 
 impl State {
@@ -267,9 +420,7 @@ impl State {
             }
             ClientMsg::Input(data) => {
                 let pane = self.focused_pane(id)?;
-                let p = self.panes.get_mut(&pane).ok_or_else(|| anyhow!("pane gone"))?;
-                p.writer.write_all(&data)?;
-                p.writer.flush()?;
+                self.panes.get(&pane).ok_or_else(|| anyhow!("pane gone"))?.input.send(data)?;
             }
             ClientMsg::Resize { rows, cols } => {
                 let name = self.client_session(id)?;
@@ -279,11 +430,10 @@ impl State {
                 let name = self.client_session(id)?;
                 let pane = self.spawn_tab(&name, profile.as_deref(), &cwd)?;
                 if let Some(cmd) = cmd.filter(|c| !c.trim().is_empty())
-                    && let Some(p) = self.panes.get_mut(&pane)
+                    && let Some(p) = self.panes.get(&pane)
                 {
                     // The PTY buffers it until the shell reads its first line.
-                    p.writer.write_all(format!("{cmd}\r").as_bytes())?;
-                    p.writer.flush()?;
+                    p.input.send(format!("{cmd}\r").into_bytes())?;
                 }
                 self.send_snapshot(pane);
                 self.send_layout(&name);
@@ -362,11 +512,7 @@ impl State {
                 let (history, data) = crate::scrollback::replay(p.parser.screen_mut());
                 tx.send(ServerMsg::History { pane, rows, cols, history: history as u32, data })?;
             }
-            ClientMsg::PaneInput { pane, data } => {
-                let p = self.session_pane(id, pane)?;
-                p.writer.write_all(&data)?;
-                p.writer.flush()?;
-            }
+            ClientMsg::PaneInput { pane, data } => self.session_pane(id, pane)?.input.send(data)?,
             ClientMsg::Busy { tab } => {
                 let (_, panes) = self.with_tab(id, |t, _| if tab { t.root.leaves() } else { vec![t.focused] })?;
                 let busy = panes.iter().filter_map(|p| self.panes.get(p)).filter_map(foreground_program).collect();
@@ -385,14 +531,84 @@ impl State {
                     self.relayout(&name, false)?;
                 }
             }
+            ClientMsg::Hello => tx.send(ServerMsg::Hello(VERSION.into()))?,
         }
         Ok(())
     }
 
+    /// Profiles `msg` may start shells in (prepared outside the lock).
+    fn spawn_profiles(&self, client: u64, msg: &ClientMsg) -> Vec<Option<String>> {
+        let exists = |name: &str| self.sessions.iter().any(|s| s.name == name);
+        match msg {
+            ClientMsg::Attach { session, create: true, profile, .. } => {
+                let missing = match session {
+                    Some(n) => !exists(n),
+                    None => self.sessions.is_empty(),
+                };
+                if missing { vec![profile.clone()] } else { vec![] }
+            }
+            ClientMsg::NewTab { profile, .. } => vec![profile.clone()],
+            ClientMsg::OpenWorkspace { spec, .. } if !exists(&spec.name) => {
+                spec.tabs.iter().map(|t| t.profile.clone()).collect()
+            }
+            ClientMsg::Split { .. } => {
+                let tab = self.clients.get(&client).and_then(|c| self.sessions.iter().find(|s| s.name == c.session));
+                tab.and_then(|s| s.tabs.get(s.active)).map(|t| vec![t.profile.clone()]).unwrap_or_default()
+            }
+            _ => vec![],
+        }
+    }
+
+    fn on_event(&mut self, ev: Event) {
+        match ev {
+            Event::Output(id, data) => {
+                let scrollback = self.scrollback;
+                let Some(pane) = self.panes.get_mut(&id) else { return };
+                let (rows, cols) = pane.parser.screen().size();
+                if let Err(e) = crate::vt::process(&mut pane.parser, &data) {
+                    // The bytes that broke it aren't forwarded: clients get
+                    // the reset screen instead.
+                    eprintln!("pane {id}: terminal emulator panicked ({e}); screen reset");
+                    pane.parser = vt100::Parser::new_with_callbacks(rows, cols, scrollback, Clip::default());
+                    let _ = crate::vt::process(&mut pane.parser, RESET_NOTICE);
+                    self.send_snapshot(id);
+                    return;
+                }
+                let clips = std::mem::take(&mut pane.parser.callbacks_mut().0);
+                let session = pane.session.clone();
+                self.send_to_session(&session, || ServerMsg::Output { pane: id, data: data.clone() });
+                for c in clips {
+                    self.send_to_session(&session, || ServerMsg::Clipboard(c.clone()));
+                }
+            }
+            Event::Exited(id) => {
+                if self.remove_pane(id) {
+                    shutdown(self);
+                }
+            }
+            Event::Escalate(id) => {
+                if let Some(p) = self.panes.get_mut(&id) && signal(&mut *p.child, libc::SIGKILL) {
+                    eprintln!("pane {id}: shell ignored SIGHUP; killed");
+                }
+            }
+            Event::Exit => {
+                for p in self.panes.values_mut() {
+                    signal(&mut *p.child, libc::SIGKILL);
+                }
+                std::process::exit(0);
+            }
+        }
+    }
+
     /// Spawn a shell in `profile` with a `rows`×`cols` PTY. Returns its pane id and the profile colour.
     fn spawn_pane(&mut self, session: &str, profile: Option<&str>, cwd: &str, rows: u16, cols: u16) -> Result<(u32, String)> {
-        let env = profile::spawn_env(profile)?;
-        let (rows, cols) = (rows.max(1), cols.max(1));
+        let env = match self.prepared.get(&profile.map(String::from)) {
+            Some(Ok(env)) => clone_env(env),
+            Some(Err(e)) => bail!("{e}"),
+            None => profile::spawn_env(profile)?,
+        };
+        // Never a 1-column emulator (a wide character would not fit).
+        let (rows, cols) = (rows.max(MIN_ROWS), cols.max(MIN_COLS));
         let pair = native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
         let shell = self.shell.clone().or_else(|| std::env::var("SHELL").ok()).unwrap_or_else(|| "/bin/sh".into());
         let mut cmd = CommandBuilder::new(&shell);
@@ -438,7 +654,7 @@ impl State {
         self.panes.insert(id, Pane {
             session: session.into(),
             master: pair.master,
-            writer,
+            input: PaneInput::new(writer, INPUT_QUEUE_MAX),
             child,
             parser: vt100::Parser::new_with_callbacks(rows, cols, self.scrollback, Clip::default()),
         });
@@ -503,9 +719,8 @@ impl State {
             if let Some(cmd) = &p.cmd {
                 // Typed into the shell: it runs once the shell reads its input,
                 // and the shell (with history) remains when it exits.
-                let pane = self.panes.get_mut(&id).ok_or_else(|| anyhow!("pane gone"))?;
-                pane.writer.write_all(format!("{cmd}\n").as_bytes())?;
-                pane.writer.flush()?;
+                let pane = self.panes.get(&id).ok_or_else(|| anyhow!("pane gone"))?;
+                pane.input.send(format!("{cmd}\n").into_bytes())?;
             }
             Ok(id)
         })?;
@@ -537,12 +752,22 @@ impl State {
     /// the tab's profile and starts in the focused shell's directory.
     fn split(&mut self, client: u64, axis: Axis, fallback_cwd: String) -> Result<()> {
         let new = self.next_pane;
-        let (name, (focused, profile, rect)) = self.with_tab(client, |t, area| {
+        let (name, (focused, profile, rect, fits)) = self.with_tab(client, |t, area| {
+            // Like tmux: the focused pane must hold two panes and a border
+            // (unzoomed size), and the whole tab must still fit.
+            let cur = t.root.geometry(area).into_iter().find(|(id, _)| *id == t.focused).map_or(area, |(_, r)| r);
+            let room = match axis {
+                Axis::Horizontal => cur.cols > 2 * MIN_COLS,
+                Axis::Vertical => cur.rows > 2 * MIN_ROWS,
+            };
             let mut root = t.root.clone();
             root.split(t.focused, new, axis);
             let rect = root.geometry(area).into_iter().find(|(id, _)| *id == new).map(|(_, r)| r).unwrap_or(area);
-            (t.focused, t.profile.clone(), rect)
+            (t.focused, t.profile.clone(), rect, room && root.fits(area))
         })?;
+        if !fits {
+            bail!("no room to split: panes need at least {MIN_COLS} columns and {MIN_ROWS} row");
+        }
         let cwd = self
             .panes
             .get(&focused)
@@ -560,9 +785,17 @@ impl State {
         Ok(())
     }
 
+    /// SIGHUP the pane's shell (it exits and hangs up its jobs); SIGKILL it
+    /// `KILL_GRACE` later if it's still there. Never waits under the lock.
     fn kill_pane(&mut self, id: u32) {
-        if let Some(p) = self.panes.get_mut(&id) {
-            let _ = p.child.kill();
+        if let Some(p) = self.panes.get_mut(&id)
+            && signal(&mut *p.child, libc::SIGHUP)
+        {
+            let events = self.events.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(KILL_GRACE);
+                let _ = events.send(Event::Escalate(id));
+            });
         }
     }
 
@@ -636,7 +869,9 @@ impl State {
         let mut changed = Vec::new();
         for (id, r) in geometry {
             let Some(p) = self.panes.get_mut(&id) else { continue };
-            let (rows, cols) = (r.rows.max(1), r.cols.max(1));
+            // A pane can be under the minimum only when the whole area is
+            // (tiny terminal): its emulator stays at the minimum, clipped when drawn.
+            let (rows, cols) = (r.rows.max(MIN_ROWS), r.cols.max(MIN_COLS));
             if p.parser.screen().size() != (rows, cols) {
                 p.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
                 p.parser.screen_mut().set_size(rows, cols);
@@ -766,4 +1001,83 @@ fn pid_cwd(pid: u32) -> Option<String> {
 #[cfg(not(target_os = "macos"))]
 fn pid_cwd(pid: u32) -> Option<String> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok().map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// A PTY whose program doesn't read: each write waits for a token (or for
+    /// the token sender to go away).
+    struct Stuck(mpsc::Receiver<()>, Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Stuck {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let _ = self.0.recv();
+            self.1.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pane_input_never_blocks_and_drops_when_full() {
+        let (unstick, stuck) = mpsc::channel();
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let input = PaneInput::new(Box::new(Stuck(stuck, out.clone())), 10);
+        let start = Instant::now();
+        input.send(b"aaaa".to_vec()).unwrap();
+        input.send(b"bbbb".to_vec()).unwrap();
+        input.send(b"cc".to_vec()).unwrap();
+        input.send(Vec::new()).unwrap(); // nothing to queue
+        let err = input.send(b"d".to_vec()).unwrap_err().to_string();
+        assert!(err.contains("pane is not reading input"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(1), "send blocked");
+        // The program reads again: everything queued arrives, in order.
+        drop(unstick);
+        for _ in 0..200 {
+            if out.lock().unwrap().len() == 10 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(&out.lock().unwrap()[..], b"aaaabbbbcc");
+        for _ in 0..200 {
+            if input.queued.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        input.send(b"e".to_vec()).unwrap();
+        // One chunk bigger than the budget still goes through when nothing waits.
+        let big = PaneInput::new(Box::new(Vec::new()), 10);
+        big.send(vec![b'x'; 100]).unwrap();
+    }
+
+    #[test]
+    fn pane_input_closed_writer_errors_instead_of_blocking() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let input = PaneInput::new(Box::new(Broken), 10);
+        input.send(b"a".to_vec()).unwrap();
+        let mut closed = false;
+        for _ in 0..200 {
+            if input.send(b"b".to_vec()).is_err() {
+                closed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(closed);
+    }
 }
