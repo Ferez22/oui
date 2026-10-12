@@ -13,7 +13,10 @@ mod render;
 
 use crate::config::{self, Config};
 use crate::profile;
-use crate::protocol::{ClientMsg, Layout, ServerMsg, read_msg, socket_path, write_msg};
+use crate::protocol::{
+    ClientMsg, KILL_FRAME, LEGACY_KILL_SERVER, LEGACY_OK, Layout, Mismatch, PROTOCOL_VERSION, ServerMsg, VERSION, read_msg,
+    socket_path, write_msg,
+};
 use crate::workspace::WorkspaceSpec;
 use anyhow::{Context, Result, bail};
 use crate::config::Action;
@@ -28,14 +31,114 @@ use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 const CHROME_ROWS: u16 = 2; // tab bar + status bar
 
-/// Connect to the daemon, starting it if needed.
+/// Connect to the daemon (starting it if needed) and check it speaks our
+/// protocol. A daemon on another version gives a `ServerMismatch` error.
 pub async fn connect(spawn: bool) -> Result<UnixStream> {
+    let mut s = connect_socket(spawn).await?;
+    handshake(&mut s).await?;
+    Ok(s)
+}
+
+/// The running daemon speaks another protocol (`None`: the unversioned one).
+#[derive(Debug)]
+pub struct ServerMismatch(pub Option<u16>);
+
+impl std::fmt::Display for ServerMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let server = match self.0 {
+            Some(v) => format!("protocol {v}"),
+            None => "protocol 1".to_string(),
+        };
+        if self.0.is_some_and(|v| v > PROTOCOL_VERSION) {
+            write!(
+                f,
+                "A newer oUI background server is running ({server}) than this oui ({VERSION}). \
+                 Use the newer oui, or run `oui kill-server` (this closes your sessions) and start oui again."
+            )
+        } else {
+            write!(
+                f,
+                "oUI was updated but an older background server is still running. \
+                 Run `oui kill-server` (this closes your sessions) and start oui again. \
+                 (server: {server}; this oui: {VERSION})"
+            )
+        }
+    }
+}
+
+impl std::error::Error for ServerMismatch {}
+
+/// Hello / version check. An unversioned daemon drops the connection on our
+/// first frame without acting on it.
+async fn handshake(s: &mut UnixStream) -> Result<()> {
+    write_msg(s, &ClientMsg::Hello).await?;
+    let reply = match tokio::time::timeout(Duration::from_secs(10), read_msg::<_, ServerMsg>(s)).await {
+        Ok(r) => r,
+        Err(_) => bail!("the oUI server did not answer (this oui: {VERSION})"),
+    };
+    match reply {
+        Ok(ServerMsg::Hello(_)) => Ok(()),
+        Ok(other) => bail!("unexpected reply from the oUI server: {other:?} (this oui: {VERSION})"),
+        Err(e) => {
+            if let Some(Mismatch(v)) = e.downcast_ref::<Mismatch>() {
+                return Err(ServerMismatch(*v).into());
+            }
+            let dropped = e.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                use std::io::ErrorKind::*;
+                matches!(io.kind(), UnexpectedEof | ConnectionReset | BrokenPipe)
+            });
+            if dropped {
+                return Err(ServerMismatch(None).into());
+            }
+            Err(e)
+        }
+    }
+}
+
+/// `oui kill-server`. Also stops a daemon on another protocol version, so an
+/// upgrade can always be finished: an unversioned one with the exact bytes
+/// its `KillServer` had, a versioned one with `KILL_FRAME`.
+pub async fn kill_server() -> Result<()> {
+    let err = match connect(false).await {
+        Ok(mut s) => {
+            write_msg(&mut s, &ClientMsg::KillServer).await?;
+            return match read_msg::<_, ServerMsg>(&mut s).await? {
+                ServerMsg::Error(e) => bail!(e),
+                _ => Ok(()),
+            };
+        }
+        Err(e) => e,
+    };
+    let Some(ServerMismatch(version)) = err.downcast_ref::<ServerMismatch>() else { return Err(err) };
+    let mut s = connect_socket(false).await?;
+    match version {
+        None => s.write_all(&LEGACY_KILL_SERVER).await?,
+        Some(_) => s.write_all(&KILL_FRAME).await?,
+    }
+    // Wait for the server to close the connection (it replies `Ok` first if it's unversioned).
+    let mut sink = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut sink)).await;
+    let acked = version.is_none() && sink.starts_with(&LEGACY_OK);
+    let path = socket_path()?;
+    for _ in 0..50 {
+        if acked || !path.exists() {
+            println!("stopped the older oUI server");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    bail!("the old oUI server did not stop; stop it with: pkill -f 'oui daemon'")
+}
+
+/// Connect to the daemon's socket, starting the daemon if needed.
+async fn connect_socket(spawn: bool) -> Result<UnixStream> {
     let path = socket_path()?;
     if let Ok(s) = UnixStream::connect(&path).await {
         return Ok(s);
@@ -384,7 +487,10 @@ impl App {
             ServerMsg::Snapshot { pane, rows, cols, data } => {
                 // Keep scrollback locally too, so history grows with output.
                 let mut p = vt100::Parser::new(rows, cols, self.config.general.scrollback);
-                p.process(&data);
+                if crate::vt::process(&mut p, &data).is_err() {
+                    p = vt100::Parser::new(rows, cols, self.config.general.scrollback);
+                    self.flash = Some(format!("pane {pane}: display reset after a terminal emulator error"));
+                }
                 self.screens.insert(pane, p);
                 self.have_history.remove(&pane);
                 // Size changed under copy mode: positions are meaningless now.
@@ -393,8 +499,12 @@ impl App {
                 }
             }
             ServerMsg::History { pane, rows, cols, history, data } => {
-                let mut p = vt100::Parser::new(rows, cols, self.config.general.scrollback.max(history as usize));
-                p.process(&data);
+                let scrollback = self.config.general.scrollback.max(history as usize);
+                let mut p = vt100::Parser::new(rows, cols, scrollback);
+                if crate::vt::process(&mut p, &data).is_err() {
+                    p = vt100::Parser::new(rows, cols, scrollback);
+                    self.flash = Some(format!("pane {pane}: display reset after a terminal emulator error"));
+                }
                 let old = self.screens.insert(pane, p);
                 self.have_history.insert(pane);
                 if let (Some(c), Some(mut old)) = (self.copy.as_mut().filter(|c| c.pane == pane), old) {
@@ -410,7 +520,14 @@ impl App {
             }
             ServerMsg::Output { pane, data } => {
                 if let Some(p) = self.screens.get_mut(&pane) {
-                    p.process(&data);
+                    if crate::vt::process(p, &data).is_err() {
+                        // Start over from the daemon's copy of the screen.
+                        let (rows, cols) = p.screen().size();
+                        *p = vt100::Parser::new(rows, cols, self.config.general.scrollback);
+                        self.outbox.push(ClientMsg::History(pane));
+                        self.flash = Some(format!("pane {pane}: display reset after a terminal emulator error"));
+                        return;
+                    }
                     if let Some(c) = self.copy.as_mut().filter(|c| c.pane == pane) {
                         c.sync(p);
                     }
@@ -801,3 +918,77 @@ impl App {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{MAGIC, encode};
+
+    /// Run `handshake` against a fake daemon doing `server` on the other end.
+    async fn against<F, Fut>(server: F) -> Result<()>
+    where
+        F: FnOnce(UnixStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (mut client, daemon) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(server(daemon));
+        let r = handshake(&mut client).await;
+        task.await.unwrap();
+        r
+    }
+
+    fn mismatch(r: Result<()>) -> Option<Option<u16>> {
+        r.err()?.downcast_ref::<ServerMismatch>().map(|m| m.0)
+    }
+
+    #[tokio::test]
+    async fn handshake_ok_with_current_daemon() {
+        let r = against(|mut d| async move {
+            let _: ClientMsg = read_msg(&mut d).await.unwrap();
+            write_msg(&mut d, &ServerMsg::Hello(VERSION.into())).await.unwrap();
+        })
+        .await;
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn unversioned_daemon_dropping_the_connection_is_detected() {
+        // What a protocol 1 daemon does: read a u32 length, find it over
+        // 16 MiB, drop the connection without acting.
+        let r = against(|mut d| async move {
+            let len = d.read_u32().await.unwrap();
+            assert!(len as usize > 16 * 1024 * 1024);
+        })
+        .await;
+        assert_eq!(mismatch(r), Some(None));
+        let text = ServerMismatch(None).to_string();
+        assert!(text.starts_with(
+            "oUI was updated but an older background server is still running. Run `oui kill-server` \
+             (this closes your sessions) and start oui again."
+        ));
+        assert!(text.contains(VERSION));
+    }
+
+    #[tokio::test]
+    async fn other_protocol_versions_are_refused() {
+        for v in [3u16, 1] {
+            let r = against(move |mut d| async move {
+                let _ = d.read_u32().await;
+                let mut f = encode(&ServerMsg::Error("x".into())).unwrap();
+                f[4..6].copy_from_slice(&v.to_be_bytes());
+                d.write_all(&f).await.unwrap();
+            })
+            .await;
+            assert_eq!(mismatch(r), Some(Some(v)));
+        }
+        assert!(ServerMismatch(Some(3)).to_string().starts_with("A newer oUI background server"));
+        // Legacy-looking reply (bare length prefix).
+        let r = against(|mut d| async move {
+            let _ = d.read_u32().await;
+            d.write_all(&crate::protocol::legacy_exit("old")).await.unwrap();
+        })
+        .await;
+        assert_eq!(mismatch(r), Some(None));
+        assert_eq!(&MAGIC, b"oUIp");
+    }
+}

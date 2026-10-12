@@ -11,6 +11,7 @@ mod protocol;
 mod tmux_import;
 mod workspace;
 mod scrollback;
+mod vt;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -20,7 +21,7 @@ use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 #[derive(Parser)]
-#[command(name = "oui", version, about = "oUI: terminal profiles with isolated logins + tmux-style sessions")]
+#[command(name = "oui", version = protocol::VERSION, about = "oUI: terminal profiles with isolated logins + tmux-style sessions")]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -201,7 +202,7 @@ fn main() -> Result<()> {
         Some(Cmd::Attach { session }) => rt()?.block_on(client::run(session, false, None)),
         Some(Cmd::Ls) => rt()?.block_on(client::request(ClientMsg::ListSessions)),
         Some(Cmd::Kill { session }) => rt()?.block_on(client::request(ClientMsg::KillSession(session))),
-        Some(Cmd::KillServer) => rt()?.block_on(client::request(ClientMsg::KillServer)),
+        Some(Cmd::KillServer) => rt()?.block_on(client::kill_server()),
         Some(Cmd::Daemon) => daemon::run(),
         Some(Cmd::Open { workspace }) => rt()?.block_on(workspace::open(&workspace)),
         Some(Cmd::Workspace(WorkspaceCmd::List)) => workspace::list(),

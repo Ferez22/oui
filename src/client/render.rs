@@ -569,7 +569,10 @@ fn render_screen(screen: &vt100::Screen, area: Rect, buf: &mut Buffer) {
                     style = style.add_modifier(m);
                 }
             }
-            let sym = if cell.has_contents() { cell.contents() } else { " " };
+            // A pane narrower than its emulator (tiny terminal) is clipped; a
+            // wide character must not spill over the edge.
+            let clipped = cell.is_wide() && col + 1 >= area.width;
+            let sym = if cell.has_contents() && !clipped { cell.contents() } else { " " };
             buf[(area.x + col, area.y + row)].set_symbol(sym).set_style(style);
         }
     }

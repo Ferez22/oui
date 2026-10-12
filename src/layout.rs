@@ -7,6 +7,14 @@ use serde::{Deserialize, Serialize};
 const MIN_RATIO: f32 = 0.1;
 const MAX_RATIO: f32 = 0.9;
 
+/// Smallest pane: a wide (2-cell) character must always fit on a row, or the
+/// terminal emulator panics. Splits that would go below this are refused;
+/// geometry keeps every pane at least this big whenever the area allows it,
+/// and PTYs/emulators are never made smaller even when it doesn't (tiny
+/// terminal): the pane is then clipped when drawn.
+pub const MIN_COLS: u16 = 2;
+pub const MIN_ROWS: u16 = 1;
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
     Left,
@@ -156,11 +164,36 @@ impl Node {
         match self {
             Node::Leaf(id) => out.push((*id, area)),
             Node::Split { axis, ratio, a, b } => {
-                let (ra, rb) = split_rect(area, *axis, *ratio);
+                let along = |n: &Node| match axis {
+                    Axis::Horizontal => n.min_size().0,
+                    Axis::Vertical => n.min_size().1,
+                };
+                let (ra, rb) = split_rect(area, *axis, *ratio, (along(a), along(b)));
                 a.layout_into(ra, out);
                 b.layout_into(rb, out);
             }
         }
+    }
+
+    /// Smallest area (cols, rows) in which every pane gets at least
+    /// `MIN_COLS`×`MIN_ROWS`.
+    pub fn min_size(&self) -> (u16, u16) {
+        match self {
+            Node::Leaf(_) => (MIN_COLS, MIN_ROWS),
+            Node::Split { axis, a, b, .. } => {
+                let ((ac, ar), (bc, br)) = (a.min_size(), b.min_size());
+                match axis {
+                    Axis::Horizontal => (ac.saturating_add(bc).saturating_add(1), ar.max(br)),
+                    Axis::Vertical => (ac.max(bc), ar.saturating_add(br).saturating_add(1)),
+                }
+            }
+        }
+    }
+
+    /// Whether every pane gets at least `MIN_COLS`×`MIN_ROWS` inside `area`.
+    pub fn fits(&self, area: Rect) -> bool {
+        let (cols, rows) = self.min_size();
+        area.cols >= cols && area.rows >= rows
     }
 
     /// Move the divider of the nearest split around `id` along `dir`'s axis
@@ -182,14 +215,23 @@ impl Node {
     }
 }
 
-/// Split `area` into two rects with a 1-cell border between them.
-fn split_rect(area: Rect, axis: Axis, ratio: f32) -> (Rect, Rect) {
+/// Split `area` into two rects with a 1-cell border between them. `min` is
+/// the smallest size (along `axis`) each side needs; honoured when it fits.
+fn split_rect(area: Rect, axis: Axis, ratio: f32, min: (u16, u16)) -> (Rect, Rect) {
     let total = match axis {
         Axis::Horizontal => area.cols,
         Axis::Vertical => area.rows,
     };
     let avail = total.saturating_sub(1);
-    let first = if avail < 2 { avail } else { ((avail as f32 * ratio).round() as u16).clamp(1, avail - 1) };
+    let want = (avail as f32 * ratio).round() as u16;
+    let first = if avail >= min.0.saturating_add(min.1) {
+        want.clamp(min.0, avail - min.1)
+    } else if avail < 2 {
+        avail
+    } else {
+        // Too small for both: still never let a side vanish.
+        want.clamp(1, avail - 1)
+    };
     let second = avail - first;
     match axis {
         Axis::Horizontal => (
@@ -348,6 +390,77 @@ mod tests {
             assert_eq!(g.len(), 3);
             assert!(g.iter().filter(|(_, r)| r.cols > 0).all(|(_, r)| r.x + r.cols <= cols));
         }
+    }
+
+    #[test]
+    fn panes_keep_minimum_size() {
+        // Keep splitting the newest pane to the right, like a user would.
+        let area = Rect::new(0, 0, 20, 5);
+        let mut t = Node::Leaf(1);
+        let mut next = 2;
+        while {
+            let mut trial = t.clone();
+            trial.split(next - 1, next, Axis::Horizontal);
+            trial.fits(area).then(|| t = trial).is_some()
+        } {
+            next += 1;
+        }
+        let g = t.geometry(area);
+        assert!(g.len() >= 4, "{g:?}");
+        assert!(g.iter().all(|(_, r)| r.cols >= MIN_COLS && r.rows >= MIN_ROWS), "{g:?}");
+        assert!(g.iter().all(|(_, r)| r.x + r.cols <= area.cols));
+        // The refused split would have produced a pane under the minimum.
+        let mut trial = t.clone();
+        trial.split(next - 1, next, Axis::Horizontal);
+        assert!(!trial.fits(area));
+        assert!(trial.geometry(area).iter().any(|(_, r)| r.cols < MIN_COLS));
+    }
+
+    #[test]
+    fn min_size_of_trees() {
+        assert_eq!(Node::Leaf(1).min_size(), (2, 1));
+        let mut t = Node::Leaf(1);
+        t.split(1, 2, Axis::Horizontal); // 1 | 2
+        assert_eq!(t.min_size(), (5, 1));
+        t.split(2, 3, Axis::Vertical); // 1 | (2 / 3)
+        assert_eq!(t.min_size(), (5, 3));
+        t.split(1, 4, Axis::Horizontal); // (1 | 4) | (2 / 3)
+        assert_eq!(t.min_size(), (8, 3));
+        assert!(t.fits(Rect::new(0, 0, 8, 3)));
+        assert!(!t.fits(Rect::new(0, 0, 7, 3)));
+        assert!(!t.fits(Rect::new(0, 0, 8, 2)));
+        // Exactly the minimum area: every pane is exactly at the minimum.
+        let g = t.geometry(Rect::new(0, 0, 8, 3));
+        assert!(g.iter().all(|(_, r)| r.cols == MIN_COLS), "{g:?}");
+    }
+
+    #[test]
+    fn extreme_ratios_respect_minimum() {
+        // A workspace tree or repeated resizes push the divider to the edge.
+        let mut t = Node::Leaf(1);
+        t.split(1, 2, Axis::Horizontal);
+        t.split(2, 3, Axis::Horizontal);
+        for _ in 0..40 {
+            t.resize(3, Dir::Right, 0.1);
+            t.resize(2, Dir::Right, 0.1);
+        }
+        for cols in 8..40 {
+            let g = t.geometry(Rect::new(0, 0, cols, 3));
+            assert!(g.iter().all(|(_, r)| r.cols >= MIN_COLS), "cols {cols}: {g:?}");
+        }
+        let tree = Tree::Split {
+            axis: Axis::Vertical,
+            ratio: 0.0,
+            a: Box::new(Tree::Leaf(())),
+            b: Box::new(Tree::Leaf(())),
+        };
+        let mut n = 0;
+        let node = Node::build(&tree, &mut |_| -> Result<u32, ()> {
+            n += 1;
+            Ok(n)
+        })
+        .unwrap();
+        assert!(node.geometry(Rect::new(0, 0, 10, 3)).iter().all(|(_, r)| r.rows >= MIN_ROWS));
     }
 
     #[test]
