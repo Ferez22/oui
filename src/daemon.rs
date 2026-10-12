@@ -33,7 +33,23 @@ struct Pane {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
-    parser: vt100::Parser,
+    parser: vt100::Parser<Clip>,
+}
+
+/// Largest OSC 52 payload (base64) forwarded from a pane to clients.
+pub const OSC52_MAX: usize = 140 * 1024; // ~100 KB of text
+
+/// vt100 callbacks: collects clipboard writes (OSC 52) from the pane's app.
+#[derive(Default)]
+struct Clip(Vec<Vec<u8>>);
+
+impl vt100::Callbacks for Clip {
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _ty: &[u8], data: &[u8]) {
+        // `?` is a paste request; we never answer those.
+        if data != b"?" && data.len() <= OSC52_MAX {
+            self.0.push(data.to_vec());
+        }
+    }
 }
 
 /// A tab is a profile boundary: every pane in it runs in `profile`.
@@ -140,8 +156,12 @@ async fn serve() -> Result<()> {
                 Event::Output(id, data) => {
                     let Some(pane) = st.panes.get_mut(&id) else { continue };
                     pane.parser.process(&data);
+                    let clips = std::mem::take(&mut pane.parser.callbacks_mut().0);
                     let session = pane.session.clone();
                     st.send_to_session(&session, || ServerMsg::Output { pane: id, data: data.clone() });
+                    for c in clips {
+                        st.send_to_session(&session, || ServerMsg::Clipboard(c.clone()));
+                    }
                 }
                 Event::Exited(id) => {
                     if st.remove_pane(id) {
@@ -336,6 +356,35 @@ impl State {
                 tx.send(ServerMsg::Ok)?;
                 shutdown(self);
             }
+            ClientMsg::History(pane) => {
+                let p = self.session_pane(id, pane)?;
+                let (rows, cols) = p.parser.screen().size();
+                let (history, data) = crate::scrollback::replay(p.parser.screen_mut());
+                tx.send(ServerMsg::History { pane, rows, cols, history: history as u32, data })?;
+            }
+            ClientMsg::PaneInput { pane, data } => {
+                let p = self.session_pane(id, pane)?;
+                p.writer.write_all(&data)?;
+                p.writer.flush()?;
+            }
+            ClientMsg::Busy { tab } => {
+                let (_, panes) = self.with_tab(id, |t, _| if tab { t.root.leaves() } else { vec![t.focused] })?;
+                let busy = panes.iter().filter_map(|p| self.panes.get(p)).filter_map(foreground_program).collect();
+                tx.send(ServerMsg::Busy(busy))?;
+            }
+            ClientMsg::FocusPane(pane) => {
+                let (name, changed) = self.with_tab(id, |t, _| {
+                    let ok = t.root.contains(pane) && t.focused != pane;
+                    if ok {
+                        t.focused = pane;
+                        t.zoomed = false;
+                    }
+                    ok
+                })?;
+                if changed {
+                    self.relayout(&name, false)?;
+                }
+            }
         }
         Ok(())
     }
@@ -391,7 +440,7 @@ impl State {
             master: pair.master,
             writer,
             child,
-            parser: vt100::Parser::new(rows, cols, self.scrollback),
+            parser: vt100::Parser::new_with_callbacks(rows, cols, self.scrollback, Clip::default()),
         });
         Ok((id, env.color))
     }
@@ -658,6 +707,12 @@ impl State {
         Ok((name, f(tab, area)))
     }
 
+    /// A pane of the client's session.
+    fn session_pane(&mut self, client: u64, pane: u32) -> Result<&mut Pane> {
+        let name = self.client_session(client)?;
+        self.panes.get_mut(&pane).filter(|p| p.session == name).ok_or_else(|| anyhow!("no pane {pane}"))
+    }
+
     fn focused_pane(&mut self, client: u64) -> Result<u32> {
         Ok(self.with_tab(client, |t, _| t.focused)?.1)
     }
@@ -666,6 +721,29 @@ impl State {
 /// Tab names are one short line of printable text.
 fn clean_tab_name(name: &str) -> String {
     name.chars().filter(|c| !c.is_control()).take(32).collect::<String>().trim().to_string()
+}
+
+/// The program in the pane's foreground when it isn't the shell itself: the
+/// PTY's foreground process group differs from the shell's pid.
+fn foreground_program(p: &Pane) -> Option<String> {
+    let pgrp = p.master.process_group_leader().filter(|&g| g > 0)? as u32;
+    if Some(pgrp) == p.child.process_id() {
+        return None;
+    }
+    Some(pid_name(pgrp).unwrap_or_else(|| format!("process {pgrp}")))
+}
+
+#[cfg(target_os = "macos")]
+fn pid_name(pid: u32) -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: proc_name writes at most `buf.len()` bytes into `buf`.
+    let n = unsafe { libc::proc_name(pid as libc::c_int, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pid_name(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// Current directory of process `pid`, so a split starts where the focused shell is.

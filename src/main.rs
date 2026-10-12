@@ -8,7 +8,9 @@ mod keychain;
 mod layout;
 mod profile;
 mod protocol;
+mod tmux_import;
 mod workspace;
+mod scrollback;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -99,6 +101,42 @@ enum ConfigCmd {
     Default,
     /// Check the config file for errors
     Check,
+    /// Translate a tmux config (default: ~/.tmux.conf or ~/.config/tmux/tmux.conf)
+    /// into an oUI config; prints it unless --write
+    ImportTmux {
+        /// tmux config file to read
+        path: Option<std::path::PathBuf>,
+        /// Save to ~/.oui/config.toml
+        #[arg(long)]
+        write: bool,
+        /// With --write, replace an existing config.toml
+        #[arg(long, requires = "write")]
+        force: bool,
+    },
+}
+
+fn import_tmux(path: Option<std::path::PathBuf>, write: bool, force: bool) -> Result<()> {
+    let Some(path) = path.or_else(tmux_import::find_tmux_conf) else {
+        anyhow::bail!(
+            "no tmux config found ($XDG_CONFIG_HOME/tmux/tmux.conf, ~/.config/tmux/tmux.conf, ~/.tmux.conf); pass a path"
+        );
+    };
+    let r = tmux_import::import_file(&path)?;
+    eprintln!("{}: {} imported, {} skipped", path.display(), r.imported.len(), r.skipped.len());
+    for l in &r.imported {
+        eprintln!("  + {l}");
+    }
+    for l in &r.skipped {
+        eprintln!("  - {l}");
+    }
+    if write {
+        let out = tmux_import::write_config(&r, force)?;
+        eprintln!("wrote {}", out.display());
+    } else {
+        eprintln!();
+        print!("{}", r.toml);
+    }
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -184,6 +222,7 @@ fn main() -> Result<()> {
             println!("{}: ok", config::path()?.display());
             Ok(())
         }
+        Some(Cmd::Config(ConfigCmd::ImportTmux { path, write, force })) => import_tmux(path, write, force),
         Some(Cmd::Profile(ProfileCmd::New { name, fresh, color, keychain })) => {
             profile::profile_dir(&name)?; // validate the name before asking anything
             let mode = match keychain {

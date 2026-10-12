@@ -5,7 +5,7 @@ use super::input::Mode;
 use super::{App, picker_options};
 use crate::config::{Action, Keys, Segment};
 use crate::layout;
-use crate::protocol::TabInfo;
+use crate::protocol::{Layout, TabInfo};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout as Split, Rect};
@@ -24,23 +24,7 @@ pub fn draw(app: &App, f: &mut Frame) {
     let active = layout.tabs.get(layout.active);
     let pcolor = active.map(|t| color(&t.color)).unwrap_or(Color::Gray);
 
-    // Tab bar: each tab shows its number and profile, in the profile's colour.
-    let bar = Style::new().bg(theme.tab_bar_bg.to_color(pcolor)).fg(theme.tab_bar_fg.to_color(pcolor));
-    let mut spans = vec![Span::styled(" oUI ", Style::new().add_modifier(Modifier::BOLD))];
-    for (i, t) in layout.tabs.iter().enumerate() {
-        let c = color(&t.color);
-        let style = if i == layout.active {
-            Style::new()
-                .bg(theme.tab_active_bg.to_color(c))
-                .fg(theme.tab_active_fg.to_color(c))
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().fg(c)
-        };
-        spans.push(Span::styled(tab_label(i, t), style));
-        spans.push(Span::raw(" "));
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)).style(bar), tabs_area);
+    draw_tab_bar(app, layout, tabs_area, f.buffer_mut());
 
     // Right panel: takes its columns from the pane area (the daemon was told).
     let panel_w = app.panel_width().min(pane_area.width);
@@ -81,6 +65,14 @@ pub fn draw(app: &App, f: &mut Frame) {
             super::picker::draw_sessions(f, p, &app.panel.sessions, &layout.session, &ostyle)
         }
         Some(super::Overlay::Rename(p)) => Some(super::picker::draw_prompt(f, p, &ostyle, "⏎ save · empty clears · esc cancel")),
+        Some(super::Overlay::Confirm(c)) => {
+            super::picker::draw_confirm(f, &c.title, &c.text, "y yes · n / esc no", &ostyle);
+            None
+        }
+        Some(super::Overlay::TmuxImport(o)) => {
+            super::picker::draw_tmux_offer(f, o, &ostyle);
+            None
+        }
         _ => None,
     };
     if let Some(pos) = cursor {
@@ -88,11 +80,190 @@ pub fn draw(app: &App, f: &mut Frame) {
     }
 }
 
-/// Tab bar label: " 1 profile " or " 1 name · profile " (the profile always shows).
+/// Tab bar label: " 1 profile " or " 1 name · profile " (the profile always
+/// shows). Also used for mouse hit-testing (`tab_bar`).
 pub fn tab_label(i: usize, t: &TabInfo) -> String {
     match &t.name {
         Some(name) => format!(" {} {name} · {} ", i + 1, t.profile),
         None => format!(" {} {} ", i + 1, t.profile),
+    }
+}
+
+const TAB_BAR_LEAD: &str = " oUI ";
+const TAB_GAP: u16 = 1;
+const PLUS: &str = " + ";
+
+/// What a tab bar cell is (mouse clicks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarHit {
+    Tab(usize),
+    /// The `+` button: new tab.
+    NewTab,
+    /// The session name: session picker.
+    Session,
+}
+
+/// Where everything sits on the tab bar for a terminal `width` columns wide.
+/// Tabs that don't fit are scrolled out (the active one always shows) and
+/// counted by `‹N` / `N›` markers, which select the nearest hidden tab.
+#[derive(Debug, Default, PartialEq)]
+pub struct TabBar {
+    /// (x, width, hit) for every clickable item, left to right.
+    pub items: Vec<(u16, u16, BarHit)>,
+    /// Hidden tabs on the left / right (and the marker's x).
+    pub more_left: Option<(u16, usize)>,
+    pub more_right: Option<(u16, usize)>,
+    /// First and one-past-last visible tab.
+    pub range: (usize, usize),
+}
+
+fn width_of(s: &str) -> u16 {
+    Line::raw(s).width() as u16
+}
+
+pub fn session_label(name: &str) -> String {
+    format!(" session {name} ")
+}
+
+pub fn tab_bar(layout: &Layout, width: u16) -> TabBar {
+    let lead = width_of(TAB_BAR_LEAD);
+    let plus = width_of(PLUS) + TAB_GAP;
+    let mut session = width_of(&session_label(&layout.session));
+    let labels: Vec<u16> = layout.tabs.iter().enumerate().map(|(i, t)| width_of(&tab_label(i, t)) + TAB_GAP).collect();
+    let total: u16 = labels.iter().sum();
+    // Narrow terminal: the session name goes first.
+    if lead + total + plus + session > width {
+        session = if lead + labels.get(layout.active).copied().unwrap_or(0) + plus + session + 8 <= width { session } else { 0 };
+    }
+    let avail = width.saturating_sub(lead + plus + session);
+    let n = layout.tabs.len();
+    let active = layout.active.min(n.saturating_sub(1));
+    let (start, end) = if total <= avail {
+        (0, n)
+    } else {
+        // Room for both markers ("‹99 "), then grow around the active tab.
+        let room = avail.saturating_sub(8);
+        let (mut s, mut e) = (active, (active + 1).min(n));
+        let mut used: u16 = labels.get(active).copied().unwrap_or(0);
+        loop {
+            let mut grew = false;
+            if e < n && used + labels[e] <= room {
+                used += labels[e];
+                e += 1;
+                grew = true;
+            }
+            if s > 0 && used + labels[s - 1] <= room {
+                used += labels[s - 1];
+                s -= 1;
+                grew = true;
+            }
+            if !grew {
+                break;
+            }
+        }
+        (s, e)
+    };
+    let mut bar = TabBar { range: (start, end), ..Default::default() };
+    let mut x = lead;
+    if start > 0 {
+        bar.more_left = Some((x, start));
+        x += 4;
+    }
+    for (i, w) in labels.iter().enumerate().take(end).skip(start) {
+        bar.items.push((x, w - TAB_GAP, BarHit::Tab(i)));
+        x += w;
+    }
+    if end < n {
+        bar.more_right = Some((x, n - end));
+        x += 4;
+    }
+    if x + plus <= width {
+        bar.items.push((x, width_of(PLUS), BarHit::NewTab));
+    }
+    if session > 0 {
+        bar.items.push((width - session, session, BarHit::Session));
+    }
+    bar
+}
+
+/// What's at column `x` of the tab bar (markers select the nearest hidden tab).
+pub fn bar_hit(layout: &Layout, width: u16, x: u16) -> Option<BarHit> {
+    let bar = tab_bar(layout, width);
+    if bar.more_left.is_some_and(|(mx, _)| (mx..mx + 4).contains(&x)) {
+        return Some(BarHit::Tab(bar.range.0 - 1));
+    }
+    if bar.more_right.is_some_and(|(mx, _)| (mx..mx + 4).contains(&x)) {
+        return Some(BarHit::Tab(bar.range.1));
+    }
+    bar.items.iter().find(|(ix, w, _)| (*ix..ix + w).contains(&x)).map(|(_, _, h)| *h)
+}
+
+/// The tab whose label covers column `x` of the tab bar.
+#[cfg(test)]
+pub fn tab_at(layout: &Layout, x: u16) -> Option<usize> {
+    match bar_hit(layout, 400, x) {
+        Some(BarHit::Tab(i)) => Some(i),
+        _ => None,
+    }
+}
+
+/// The tab bar: full-width band, an " oUI " badge, each tab as a block
+/// (active: profile colour background, bold), a `+` button, the session name.
+fn draw_tab_bar(app: &App, layout: &Layout, area: Rect, buf: &mut Buffer) {
+    let theme = &app.config.theme;
+    let active_color = layout.tabs.get(layout.active).map(|t| color(&t.color)).unwrap_or(Color::Gray);
+    let fg = theme.tab_bar_fg.to_color(active_color);
+    let bar = Style::new().bg(theme.tab_bar_bg.to_color(active_color)).fg(fg);
+    let inactive = Style::new().bg(theme.tab_inactive_bg.to_color(active_color)).fg(fg);
+    buf.set_style(area, bar);
+    let put = |buf: &mut Buffer, x: u16, spans: &[Span]| {
+        let mut x = area.x + x;
+        for s in spans {
+            if x >= area.right() {
+                break;
+            }
+            let (nx, _) = buf.set_stringn(x, area.y, &s.content, (area.right() - x) as usize, s.style);
+            x = nx;
+        }
+    };
+    let accent = theme.accent.to_color(active_color);
+    let badge = Style::new().bg(accent).fg(theme.tab_active_fg.to_color(active_color)).add_modifier(Modifier::BOLD);
+    put(buf, 0, &[Span::styled(TAB_BAR_LEAD, badge)]);
+    let tb = tab_bar(layout, area.width);
+    let marker = bar.add_modifier(Modifier::BOLD).fg(accent);
+    if let Some((x, n)) = tb.more_left {
+        put(buf, x, &[Span::styled(format!("‹{n:<2}"), marker)]);
+    }
+    if let Some((x, n)) = tb.more_right {
+        put(buf, x, &[Span::styled(format!(" {n:>2}›"), marker)]);
+    }
+    for &(x, _, hit) in &tb.items {
+        let spans = match hit {
+            BarHit::Tab(i) => {
+                let t = &layout.tabs[i];
+                let c = color(&t.color);
+                if i == layout.active {
+                    let st = Style::new()
+                        .bg(theme.tab_active_bg.to_color(c))
+                        .fg(theme.tab_active_fg.to_color(c))
+                        .add_modifier(Modifier::BOLD);
+                    vec![Span::styled(tab_label(i, t), st)]
+                } else {
+                    let mut v = vec![Span::styled(format!(" {} ", i + 1), inactive.add_modifier(Modifier::BOLD))];
+                    if let Some(name) = &t.name {
+                        v.push(Span::styled(format!("{name} · "), inactive));
+                    }
+                    v.push(Span::styled(format!("{} ", t.profile), inactive.fg(c)));
+                    v
+                }
+            }
+            BarHit::NewTab => vec![Span::styled(PLUS, inactive.add_modifier(Modifier::BOLD))],
+            BarHit::Session => vec![
+                Span::styled(" session ", bar.add_modifier(Modifier::DIM)),
+                Span::styled(format!("{} ", layout.session), bar.add_modifier(Modifier::BOLD)),
+            ],
+        };
+        put(buf, x, &spans);
     }
 }
 
@@ -143,14 +314,23 @@ impl StatusCtx<'_> {
             Segment::Mode => {
                 let mut v = Vec::new();
                 let mode = match (&app.input.mode, &app.overlay) {
+                    (Mode::Normal, _) if app.input.repeating() => Some("REPEAT"),
                     (Mode::Normal, _) => None,
+                    (Mode::Copy, _) => Some("COPY"),
                     (Mode::Overlay, Some(super::Overlay::Panel)) => Some("PANEL"),
                     (Mode::Overlay, Some(super::Overlay::Sessions(_))) => Some("SESSIONS"),
                     (Mode::Overlay, Some(super::Overlay::Rename(_))) => Some("RENAME"),
+                    (Mode::Overlay, Some(super::Overlay::Confirm(_) | super::Overlay::Pending(_))) => Some("CONFIRM"),
+                    (Mode::Overlay, Some(super::Overlay::TmuxImport(_))) => Some("SETUP"),
                     _ => Some("PREFIX"),
                 };
                 if let Some(m) = mode {
                     v.push(badge(m, theme.accent.to_color(self.pcolor)));
+                }
+                if matches!(app.input.mode, Mode::Copy)
+                    && let Some(p) = app.copy_prompt()
+                {
+                    v.push(Span::raw(format!(" {p}▏")));
                 }
                 if self.active.is_some_and(|t| t.zoomed) {
                     v.push(badge("ZOOM", self.pcolor));
@@ -165,7 +345,19 @@ impl StatusCtx<'_> {
                 let name = self.active.map(|t| t.profile.as_str()).unwrap_or("-");
                 vec![Span::styled(format!(" ● {name} "), Style::new().fg(self.pcolor))]
             }
-            Segment::Hints => vec![Span::raw(format!("{} ", hints(&app.input.keys)))],
+            // "close pane" stands out: it's the key for "close just this split".
+            Segment::Hints => {
+                let text = format!("{} ", hints(&app.input.keys));
+                let close = app.input.keys.key_for(Action::ClosePane).map(|k| format!("{} close pane", display_key(k)));
+                match close.and_then(|c| text.find(&c).map(|i| (i, c.len()))) {
+                    Some((i, n)) => vec![
+                        Span::raw(text[..i].to_string()),
+                        Span::styled(text[i..i + n].to_string(), Style::new().add_modifier(Modifier::BOLD)),
+                        Span::raw(text[i + n..].to_string()),
+                    ],
+                    None => vec![Span::raw(text)],
+                }
+            }
             Segment::Clock => vec![Span::raw(format!(" {} ", clock()))],
             Segment::Hostname => vec![Span::raw(format!(" {} ", app.hostname))],
             Segment::TabsCount => {
@@ -180,7 +372,7 @@ impl StatusCtx<'_> {
 }
 
 /// Key hints from the actual bindings, e.g.
-/// `^b c tab · %/" split · ←↓↑→ focus · z zoom · x close · d detach`.
+/// `^b c tab · %/" split · ←↓↑→ focus · x close pane · z zoom · d detach`.
 pub fn hints(keys: &Keys) -> String {
     let key = |a: Action| keys.key_for(a).map(display_key);
     let mut parts = vec![display_key(&keys.prefix.notation)];
@@ -195,8 +387,8 @@ pub fn hints(keys: &Keys) -> String {
     let focus = vec![key(Action::FocusLeft), key(Action::FocusDown), key(Action::FocusUp), key(Action::FocusRight)];
     let all_arrows = focus.iter().all(|k| k.as_ref().is_some_and(|k| "←↓↑→".contains(k.as_str())));
     add(focus, "focus", if all_arrows { "" } else { "/" });
+    add(vec![key(Action::ClosePane)], "close pane", "");
     add(vec![key(Action::Zoom)], "zoom", "");
-    add(vec![key(Action::ClosePane)], "close", "");
     add(vec![key(Action::Detach)], "detach", "");
     // "^b c tab · …": the prefix leads the first hint without a separator.
     let first = parts.remove(0);
@@ -252,9 +444,14 @@ fn draw_tab(app: &App, tab: &TabInfo, area: Rect, f: &mut Frame) {
     let to_screen = |r: layout::Rect| {
         Rect::new(area.x + r.x, area.y + r.y, r.cols, r.rows).intersection(area)
     };
+    let mut copy_cursor = None;
     for p in &visible {
         if let Some(parser) = app.screens.get(&p.id) {
             render_screen(parser.screen(), to_screen(p.rect), f.buffer_mut());
+            if let Some(c) = app.copy.as_ref().filter(|c| c.pane == p.id) {
+                let accent = app.config.theme.accent.to_color(color(&tab.color));
+                copy_cursor = c.overlay(parser.screen(), to_screen(p.rect), f.buffer_mut(), accent);
+            }
         }
     }
     if visible.len() > 1 {
@@ -264,6 +461,10 @@ fn draw_tab(app: &App, tab: &TabInfo, area: Rect, f: &mut Frame) {
         draw_borders(&visible.iter().map(|p| to_screen(p.rect)).collect::<Vec<_>>(), focused, colors, area, f.buffer_mut());
     }
 
+    if let (Some(pos), Mode::Copy) = (copy_cursor, &app.input.mode) {
+        f.set_cursor_position(pos);
+        return;
+    }
     let focused = visible.iter().find(|p| p.id == tab.focused);
     if let (Some(p), Mode::Normal) = (focused, &app.input.mode) {
         let Some(screen) = app.screens.get(&p.id).map(|s| s.screen()) else { return };
@@ -386,14 +587,63 @@ mod tests {
         assert_eq!(tab_label(2, &t), " 3 api · work ");
     }
 
+    fn tab(name: Option<&str>) -> TabInfo {
+        TabInfo { name: name.map(Into::into), profile: "work".into(), color: "green".into(), panes: vec![], focused: 0, zoomed: false }
+    }
+
+    #[test]
+    fn tab_at_uses_named_labels() {
+        let layout = Layout { session: "s".into(), tabs: vec![tab(Some("api")), tab(None)], active: 0 };
+        // " oUI " (0-4), " 1 api · work " (5-18), gap (19), " 2 work " (20-27).
+        assert_eq!(tab_at(&layout, 4), None);
+        assert_eq!(tab_at(&layout, 5), Some(0));
+        assert_eq!(tab_at(&layout, 18), Some(0));
+        assert_eq!(tab_at(&layout, 19), None);
+        assert_eq!(tab_at(&layout, 20), Some(1));
+        assert_eq!(tab_at(&layout, 27), Some(1));
+        assert_eq!(tab_at(&layout, 28), None);
+        // Gap, then " + " (29-31); the session name is flush right.
+        assert_eq!(bar_hit(&layout, 80, 29), Some(BarHit::NewTab));
+        assert_eq!(bar_hit(&layout, 80, 31), Some(BarHit::NewTab));
+        assert_eq!(bar_hit(&layout, 80, 32), None);
+        assert_eq!(bar_hit(&layout, 80, 79), Some(BarHit::Session));
+        assert_eq!(bar_hit(&layout, 80, 80 - session_label("s").len() as u16), Some(BarHit::Session));
+    }
+
+    #[test]
+    fn tab_bar_scrolls_to_the_active_tab() {
+        let tabs: Vec<_> = (0..20).map(|_| tab(None)).collect();
+        let mut layout = Layout { session: "main".into(), tabs, active: 15 };
+        let bar = tab_bar(&layout, 80);
+        let (s, e) = bar.range;
+        assert!(s <= 15 && 15 < e && s > 0 && e < 20, "{:?}", bar.range);
+        assert_eq!(bar.more_left.map(|m| m.1), Some(s));
+        assert_eq!(bar.more_right.map(|m| m.1), Some(20 - e));
+        assert!(bar.items.iter().all(|(x, w, _)| x + w <= 80));
+        assert!(bar.items.iter().any(|i| i.2 == BarHit::NewTab));
+        // Clicking a marker selects the nearest hidden tab.
+        let (lx, _) = bar.more_left.unwrap();
+        assert_eq!(bar_hit(&layout, 80, lx), Some(BarHit::Tab(s - 1)));
+        let (rx, _) = bar.more_right.unwrap();
+        assert_eq!(bar_hit(&layout, 80, rx + 1), Some(BarHit::Tab(e)));
+        // First tab active: no left marker.
+        layout.active = 0;
+        let bar = tab_bar(&layout, 80);
+        assert_eq!((bar.range.0, bar.more_left), (0, None));
+        // Very narrow: the session name is dropped, the active tab stays.
+        let bar = tab_bar(&layout, 30);
+        assert!(bar.items.iter().any(|i| i.2 == BarHit::Tab(0)));
+        assert!(!bar.items.iter().any(|i| i.2 == BarHit::Session));
+    }
+
     #[test]
     fn hints_follow_bindings() {
-        assert_eq!(hints(&Keys::default()), "^b c tab · %/\" split · ←↓↑→ focus · z zoom · x close · d detach");
+        assert_eq!(hints(&Keys::default()), "^b c tab · %/\" split · ←↓↑→ focus · x close pane · z zoom · d detach");
         let c = Config::parse(
             "[keys]\nprefix = \"C-a\"\n[keys.bindings]\nv = \"split-right\"\n\"%\" = \"none\"\n\"|\" = \"none\"\nUp = \"none\"\nz = \"none\"",
             None,
         )
         .unwrap();
-        assert_eq!(hints(&c.keys), "^a c tab · v/\" split · ←/↓/k/→ focus · x close · d detach");
+        assert_eq!(hints(&c.keys), "^a c tab · v/\" split · ←/↓/k/→ focus · x close pane · d detach");
     }
 }

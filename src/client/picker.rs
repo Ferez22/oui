@@ -186,6 +186,75 @@ pub fn draw_prompt(f: &mut Frame, p: &Prompt, st: &OverlayStyle, hint: &str) -> 
     ((rect.x + 2 + w).min(rect.right().saturating_sub(2)), rect.y + 1)
 }
 
+/// Wrap `text` to lines of at most `width` columns (on spaces).
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split(' ') {
+        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// A boxed message with a highlighted footer (yes/no questions).
+fn draw_message(f: &mut Frame, title: &str, body: Vec<Line>, footer: &str, width: u16, st: &OverlayStyle) {
+    let rect = centered(f.area(), width, body.len() as u16 + 4);
+    let mut lines = body;
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(format!(" {footer}"), st.border.add_modifier(Modifier::BOLD)));
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(st.block(format!(" {title} "))), rect);
+}
+
+/// A yes/no confirmation box.
+pub fn draw_confirm(f: &mut Frame, title: &str, text: &str, footer: &str, st: &OverlayStyle) {
+    let width = 60.min(f.area().width.saturating_sub(4)).max(20);
+    let body = wrap(text, width as usize - 4).into_iter().map(|l| Line::from(format!(" {l}"))).collect();
+    draw_message(f, title, body, footer, width, st);
+}
+
+/// Imported/skipped lines shown in the first-launch tmux import offer.
+const OFFER_LINES: usize = 6;
+
+/// The first-launch offer to import the user's tmux config.
+pub fn draw_tmux_offer(f: &mut Frame, o: &super::TmuxOffer, st: &OverlayStyle) {
+    let width = 76.min(f.area().width.saturating_sub(4)).max(24);
+    let w = width as usize - 4;
+    let r = &o.result;
+    let mut body: Vec<Line> = wrap(&format!("Found your tmux config ({}).", o.shown), w)
+        .into_iter()
+        .chain(wrap("Import its prefix and key bindings into oUI?", w))
+        .map(|l| Line::from(format!(" {l}")))
+        .collect();
+    body.push(Line::raw(""));
+    body.push(Line::styled(format!(" {} setting(s) to import, {} line(s) skipped:", r.imported.len(), r.skipped.len()), st.base));
+    let cut = |s: &str| {
+        let s = format!("   {s}");
+        if s.chars().count() > w { format!("{}…", s.chars().take(w - 1).collect::<String>()) } else { s }
+    };
+    for l in r.imported.iter().take(OFFER_LINES) {
+        body.push(Line::from(cut(&format!("+ {l}"))));
+    }
+    let room = OFFER_LINES.saturating_sub(r.imported.len().min(OFFER_LINES)).max(2);
+    for l in r.skipped.iter().take(room) {
+        body.push(Line::styled(cut(&format!("- {l}")), st.dim));
+    }
+    let hidden = r.imported.len().saturating_sub(OFFER_LINES) + r.skipped.len().saturating_sub(room);
+    if hidden > 0 {
+        body.push(Line::styled(cut(&format!("… {hidden} more: see `oui config import-tmux`")), st.dim));
+    }
+    draw_message(f, "tmux config", body, "[y]es · [n]o · [d]on't ask again", width, st);
+}
+
 /// Lines of the session list (also used by tests).
 pub fn session_lines(sessions: &[SessionInfo], current: &str) -> Vec<String> {
     let width = sessions.iter().map(|s| s.name.chars().count()).max().unwrap_or(0);
@@ -214,6 +283,10 @@ pub fn draw_sessions(
     let lines = session_lines(sessions, current);
     let (sel, footer) = match picker {
         SessionPicker::List { sel } => (*sel, "⏎ switch · n new · x kill · esc close".to_string()),
+        // Killing the only session (ours) ends the client too: say so.
+        SessionPicker::ConfirmKill { sel, name } if name == current && sessions.len() <= 1 => {
+            (*sel, format!("Close oUI? This ends session '{name}' and its shells. y/n"))
+        }
         SessionPicker::ConfirmKill { sel, name } => (*sel, format!("kill '{name}' and its shells? y/n")),
         SessionPicker::NewName(_) => unreachable!(),
     };
@@ -312,6 +385,15 @@ mod tests {
         p.key(b"x", &s);
         assert_eq!(p.key(b"y", &s), PickOutcome::Kill("b".into()));
         assert_eq!(p, SessionPicker::List { sel: 0 });
+    }
+
+    #[test]
+    fn wraps_on_spaces() {
+        assert_eq!(wrap("Close oUI? This ends session 'main' and its shells.", 20), [
+            "Close oUI? This ends",
+            "session 'main' and",
+            "its shells.",
+        ]);
     }
 
     #[test]
