@@ -5,7 +5,7 @@ use super::input::Mode;
 use super::{App, picker_options};
 use crate::config::{Action, Keys, Segment};
 use crate::layout;
-use crate::protocol::TabInfo;
+use crate::protocol::{Layout, TabInfo};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout as Split, Rect};
@@ -26,7 +26,7 @@ pub fn draw(app: &App, f: &mut Frame) {
 
     // Tab bar: each tab shows its number and profile, in the profile's colour.
     let bar = Style::new().bg(theme.tab_bar_bg.to_color(pcolor)).fg(theme.tab_bar_fg.to_color(pcolor));
-    let mut spans = vec![Span::styled(" oUI ", Style::new().add_modifier(Modifier::BOLD))];
+    let mut spans = vec![Span::styled(TAB_BAR_LEAD, Style::new().add_modifier(Modifier::BOLD))];
     for (i, t) in layout.tabs.iter().enumerate() {
         let c = color(&t.color);
         let style = if i == layout.active {
@@ -38,7 +38,7 @@ pub fn draw(app: &App, f: &mut Frame) {
             Style::new().fg(c)
         };
         spans.push(Span::styled(tab_label(i, t), style));
-        spans.push(Span::raw(" "));
+        spans.push(Span::raw(TAB_GAP));
     }
     f.render_widget(Paragraph::new(Line::from(spans)).style(bar), tabs_area);
 
@@ -88,12 +88,29 @@ pub fn draw(app: &App, f: &mut Frame) {
     }
 }
 
-/// Tab bar label: " 1 profile " or " 1 name · profile " (the profile always shows).
+/// Tab bar label: " 1 profile " or " 1 name · profile " (the profile always
+/// shows). Also used for mouse hit-testing (`tab_at`).
 pub fn tab_label(i: usize, t: &TabInfo) -> String {
     match &t.name {
         Some(name) => format!(" {} {name} · {} ", i + 1, t.profile),
         None => format!(" {} {} ", i + 1, t.profile),
     }
+}
+
+const TAB_BAR_LEAD: &str = " oUI ";
+const TAB_GAP: &str = " ";
+
+/// The tab whose label covers column `x` of the tab bar.
+pub fn tab_at(layout: &Layout, x: u16) -> Option<usize> {
+    let mut start = Line::raw(TAB_BAR_LEAD).width();
+    for (i, t) in layout.tabs.iter().enumerate() {
+        let w = Line::raw(tab_label(i, t)).width();
+        if (start..start + w).contains(&usize::from(x)) {
+            return Some(i);
+        }
+        start += w + TAB_GAP.len();
+    }
+    None
 }
 
 struct StatusCtx<'a> {
@@ -144,6 +161,7 @@ impl StatusCtx<'_> {
                 let mut v = Vec::new();
                 let mode = match (&app.input.mode, &app.overlay) {
                     (Mode::Normal, _) => None,
+                    (Mode::Copy, _) => Some("COPY"),
                     (Mode::Overlay, Some(super::Overlay::Panel)) => Some("PANEL"),
                     (Mode::Overlay, Some(super::Overlay::Sessions(_))) => Some("SESSIONS"),
                     (Mode::Overlay, Some(super::Overlay::Rename(_))) => Some("RENAME"),
@@ -151,6 +169,11 @@ impl StatusCtx<'_> {
                 };
                 if let Some(m) = mode {
                     v.push(badge(m, theme.accent.to_color(self.pcolor)));
+                }
+                if matches!(app.input.mode, Mode::Copy)
+                    && let Some(p) = app.copy_prompt()
+                {
+                    v.push(Span::raw(format!(" {p}▏")));
                 }
                 if self.active.is_some_and(|t| t.zoomed) {
                     v.push(badge("ZOOM", self.pcolor));
@@ -252,9 +275,14 @@ fn draw_tab(app: &App, tab: &TabInfo, area: Rect, f: &mut Frame) {
     let to_screen = |r: layout::Rect| {
         Rect::new(area.x + r.x, area.y + r.y, r.cols, r.rows).intersection(area)
     };
+    let mut copy_cursor = None;
     for p in &visible {
         if let Some(parser) = app.screens.get(&p.id) {
             render_screen(parser.screen(), to_screen(p.rect), f.buffer_mut());
+            if let Some(c) = app.copy.as_ref().filter(|c| c.pane == p.id) {
+                let accent = app.config.theme.accent.to_color(color(&tab.color));
+                copy_cursor = c.overlay(parser.screen(), to_screen(p.rect), f.buffer_mut(), accent);
+            }
         }
     }
     if visible.len() > 1 {
@@ -264,6 +292,10 @@ fn draw_tab(app: &App, tab: &TabInfo, area: Rect, f: &mut Frame) {
         draw_borders(&visible.iter().map(|p| to_screen(p.rect)).collect::<Vec<_>>(), focused, colors, area, f.buffer_mut());
     }
 
+    if let (Some(pos), Mode::Copy) = (copy_cursor, &app.input.mode) {
+        f.set_cursor_position(pos);
+        return;
+    }
     let focused = visible.iter().find(|p| p.id == tab.focused);
     if let (Some(p), Mode::Normal) = (focused, &app.input.mode) {
         let Some(screen) = app.screens.get(&p.id).map(|s| s.screen()) else { return };
@@ -384,6 +416,27 @@ mod tests {
         assert_eq!(tab_label(0, &t), " 1 work ");
         t.name = Some("api".into());
         assert_eq!(tab_label(2, &t), " 3 api · work ");
+    }
+
+    #[test]
+    fn tab_at_uses_named_labels() {
+        let tab = |name: Option<&str>| TabInfo {
+            name: name.map(Into::into),
+            profile: "work".into(),
+            color: "green".into(),
+            panes: vec![],
+            focused: 0,
+            zoomed: false,
+        };
+        let layout = Layout { session: "s".into(), tabs: vec![tab(Some("api")), tab(None)], active: 0 };
+        // " oUI " (0-4), " 1 api · work " (5-18), gap (19), " 2 work " (20-27).
+        assert_eq!(tab_at(&layout, 4), None);
+        assert_eq!(tab_at(&layout, 5), Some(0));
+        assert_eq!(tab_at(&layout, 18), Some(0));
+        assert_eq!(tab_at(&layout, 19), None);
+        assert_eq!(tab_at(&layout, 20), Some(1));
+        assert_eq!(tab_at(&layout, 27), Some(1));
+        assert_eq!(tab_at(&layout, 28), None);
     }
 
     #[test]

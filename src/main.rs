@@ -8,6 +8,7 @@ mod layout;
 mod profile;
 mod protocol;
 mod workspace;
+mod scrollback;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

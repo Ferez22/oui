@@ -4,6 +4,7 @@
 //! (`keys.prefix`, default Ctrl-b); the key after it is looked up in
 //! `keys.bindings` (see `config::Keys`).
 
+use super::mouse::{MouseEvent, Parsed, parse_sgr};
 use super::picker_options;
 use crate::config::{Action, Keys};
 use crate::layout::Dir;
@@ -22,6 +23,21 @@ pub fn next_key(bytes: &[u8]) -> (Vec<u8>, usize) {
     }
 }
 
+/// The key at the start of `bytes` for copy mode: a whole CSI / SS3 escape
+/// sequence (PgUp is `ESC [ 5 ~`), or a single byte.
+fn next_copy_key(bytes: &[u8]) -> (Vec<u8>, usize) {
+    let n = match bytes {
+        [0x1b, b'O', _, ..] => 3,
+        [0x1b, b'[', rest @ ..] => match rest.iter().position(|b| (0x40..=0x7e).contains(b)) {
+            Some(i) => i + 3,
+            None => bytes.len(),
+        },
+        [] => 0,
+        _ => 1,
+    };
+    (bytes[..n].to_vec(), n)
+}
+
 pub enum Mode {
     Normal,
     Prefix,
@@ -30,6 +46,8 @@ pub enum Mode {
     /// A client overlay (right panel focus, session picker, rename prompt) has
     /// the keyboard; keys go to `Input::ui` for the app to handle.
     Overlay,
+    /// Copy mode: keys go to `copy::Copy` (via `Event::CopyKey`).
+    Copy,
 }
 
 /// Something for the app (not the daemon) to handle, in input order.
@@ -39,6 +57,19 @@ pub enum UiEvent {
     Action(Action),
     /// A key pressed while in `Mode::Overlay`.
     Key(Vec<u8>),
+    /// The prefix was pressed in `Mode::Overlay`: close the overlay (input is
+    /// in prefix mode already), like the prefix leaves copy mode.
+    Leave,
+}
+
+/// Input the client handles itself (needs screens/layout); queued by `feed`
+/// in `Input::events` for the caller to drain.
+#[derive(Debug, PartialEq)]
+pub enum Event {
+    Mouse(MouseEvent),
+    CopyKey(Vec<u8>),
+    EnterCopy,
+    ExitCopy,
 }
 
 pub struct Input {
@@ -53,19 +84,62 @@ pub struct Input {
     cwd: String,
     /// Profile preselected in the new-tab picker.
     default_profile: Option<String>,
+    /// Parse mouse reports (`general.mouse`); set by the caller.
+    pub mouse: bool,
+    pub events: Vec<Event>,
+    /// Start of a mouse report split across reads.
+    pending: Vec<u8>,
 }
 
 impl Input {
     pub fn new(cwd: String, keys: Keys, default_profile: Option<String>) -> Self {
-        Input { mode: Mode::Normal, keys, flash: None, ui: Vec::new(), cwd, default_profile }
+        Input {
+            mode: Mode::Normal,
+            keys,
+            flash: None,
+            ui: Vec::new(),
+            cwd,
+            default_profile,
+            mouse: false,
+            events: Vec::new(),
+            pending: Vec::new(),
+        }
     }
 
     /// Feed raw stdin bytes; returns the messages to send to the daemon.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<ClientMsg> {
+        let joined;
+        let bytes = if self.pending.is_empty() {
+            bytes
+        } else {
+            joined = [std::mem::take(&mut self.pending).as_slice(), bytes].concat();
+            &joined[..]
+        };
         let mut out = Vec::new();
         let mut pass = Vec::new();
         let mut i = 0;
         while i < bytes.len() {
+            if self.mouse && bytes[i] == 0x1b {
+                match parse_sgr(&bytes[i..]) {
+                    Parsed::Event(ev, n) => {
+                        i += n;
+                        match self.mode {
+                            // Overlays (new-tab picker, panel focus, session
+                            // picker, rename) are keyboard-only: a click must
+                            // not reach the panes underneath.
+                            Mode::Picker(_) | Mode::Overlay => {}
+                            Mode::Prefix => self.mode = Mode::Normal,
+                            _ => self.events.push(Event::Mouse(ev)),
+                        }
+                        continue;
+                    }
+                    Parsed::Incomplete if bytes.len() - i >= 3 => {
+                        self.pending = bytes[i..].to_vec();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
             match self.mode {
                 Mode::Normal => match self.keys.match_prefix(&bytes[i..]) {
                     Some(n) => {
@@ -92,6 +166,28 @@ impl Input {
                         // Unbound key: swallow it (a whole arrow sequence, not just ESC).
                         None => i += next_key(&bytes[i..]).1,
                     }
+                }
+                Mode::Copy => match self.keys.match_prefix(&bytes[i..]) {
+                    // The prefix leaves copy mode and works as usual.
+                    Some(n) => {
+                        self.events.push(Event::ExitCopy);
+                        self.mode = Mode::Prefix;
+                        i += n;
+                    }
+                    None => {
+                        let (key, n) = next_copy_key(&bytes[i..]);
+                        i += n;
+                        self.events.push(Event::CopyKey(key));
+                    }
+                },
+                // As in copy mode, the prefix closes the new-tab picker or an
+                // overlay and then works as usual.
+                Mode::Picker(_) | Mode::Overlay if self.keys.match_prefix(&bytes[i..]).is_some() => {
+                    if matches!(self.mode, Mode::Overlay) {
+                        self.ui.push(UiEvent::Leave);
+                    }
+                    self.mode = Mode::Prefix;
+                    i += self.keys.match_prefix(&bytes[i..]).unwrap_or(1);
                 }
                 Mode::Picker(sel) => {
                     let (key, n) = next_key(&bytes[i..]);
@@ -154,8 +250,13 @@ impl Input {
                 self.mode = Mode::Overlay;
                 return None;
             }
+            Action::CopyMode => {
+                self.mode = Mode::Copy;
+                self.events.push(Event::EnterCopy);
+                return None;
+            }
             // Not implemented yet: give each its own arm when it lands.
-            Action::CopyMode | Action::CommandPalette => {
+            Action::CommandPalette => {
                 self.flash = Some(format!("{action}: not available yet"));
                 return None;
             }
@@ -223,6 +324,39 @@ mod tests {
     }
 
     #[test]
+    fn copy_mode_keys_and_mouse() {
+        let mut inp = Input::new("/tmp".into(), Keys::default(), None);
+        inp.mouse = true;
+        assert!(inp.feed(b"\x02[").is_empty());
+        assert!(matches!(inp.mode, Mode::Copy));
+        assert!(inp.feed(b"k\x1b[5~\x1b[A/x\r").is_empty());
+        let keys: Vec<Event> = ["", "k", "\x1b[5~", "\x1b[A", "/", "x", "\r"]
+            .iter()
+            .map(|k| if k.is_empty() { Event::EnterCopy } else { Event::CopyKey(k.as_bytes().to_vec()) })
+            .collect();
+        assert_eq!(std::mem::take(&mut inp.events), keys);
+        // A mouse report split across reads, then the prefix leaves copy mode.
+        assert!(inp.feed(b"\x1b[<64;5").is_empty());
+        assert!(inp.feed(b";6M\x02z").iter().map(|m| format!("{m:?}")).eq(["Zoom".to_string()]));
+        assert_eq!(inp.events, [
+            Event::Mouse(MouseEvent { code: 64, x: 4, y: 5, press: true }),
+            Event::ExitCopy,
+        ]);
+        assert!(matches!(inp.mode, Mode::Normal));
+        // Normal mode: typing around a click still reaches the pane.
+        inp.events.clear();
+        assert_eq!(dbg(&inp.feed(b"a\x1b[<0;1;2Mb")), ["Input([97, 98])"]);
+        assert_eq!(inp.events.len(), 1);
+    }
+
+    #[test]
+    fn mouse_off_passes_reports_through() {
+        let mut inp = Input::new("/tmp".into(), Keys::default(), None);
+        assert_eq!(dbg(&inp.feed(b"\x1b[<0;1;2M")).len(), 1);
+        assert!(inp.events.is_empty());
+    }
+
+    #[test]
     fn unimplemented_actions_flash() {
         let c = Config::parse("[keys.bindings]\nP = \"command-palette\"", None).unwrap();
         let mut inp = Input::new("/tmp".into(), c.keys, None);
@@ -251,5 +385,24 @@ mod tests {
         inp.mode = Mode::Normal;
         assert!(inp.feed(b"\x02\t").is_empty());
         assert_eq!(inp.ui, [UiEvent::Action(Action::FocusPanel)]);
+    }
+
+    #[test]
+    fn overlays_drop_mouse_and_prefix_leaves() {
+        let mut inp = Input::new("/tmp".into(), Keys::default(), None);
+        inp.mouse = true;
+        assert!(inp.feed(b"\x02s\x1b[<0;5;5Mj").is_empty());
+        assert!(inp.events.is_empty(), "no click reaches the panes under an overlay");
+        assert_eq!(inp.ui, [UiEvent::Action(Action::SessionPicker), UiEvent::Key(b"j".to_vec())]);
+        inp.ui.clear();
+        // Like copy mode, the prefix leaves the overlay and works as usual.
+        assert_eq!(dbg(&inp.feed(b"\x02z")), ["Zoom"]);
+        assert_eq!(inp.ui, [UiEvent::Leave]);
+        assert!(matches!(inp.mode, Mode::Normal));
+        // New-tab picker: clicks dropped too, the prefix closes it.
+        assert!(inp.feed(b"\x02c\x1b[<0;5;5M").is_empty());
+        assert!(inp.events.is_empty());
+        assert_eq!(dbg(&inp.feed(b"\x02z")), ["Zoom"]);
+        assert!(matches!(inp.mode, Mode::Normal));
     }
 }

@@ -3,7 +3,10 @@
 //! `input` turns raw stdin into daemon messages, `render` draws the screen,
 //! `panel` is the right panel, `picker` the session picker and prompts.
 
+mod clipboard;
+mod copy;
 mod input;
+mod mouse;
 mod panel;
 mod picker;
 mod render;
@@ -20,8 +23,8 @@ use picker::{PickOutcome, Prompt, PromptOutcome, SessionPicker};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::{execute, terminal};
-use std::collections::HashMap;
-use std::io::Read;
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -106,6 +109,15 @@ struct App {
     /// First-tab profile for sessions created from the session picker.
     new_session_profile: Option<String>,
     bg: UnboundedSender<panel::Bg>,
+    // --- Copy mode / mouse.
+    copy: Option<copy::Copy>,
+    drag: Option<mouse::Drag>,
+    /// Pane cell where the current drag started.
+    drag_start: (u16, u16),
+    /// Panes whose parser holds the daemon's scrollback (`ServerMsg::History`).
+    have_history: HashSet<u32>,
+    /// Messages produced while handling server messages, sent by the main loop.
+    outbox: Vec<ClientMsg>,
 }
 
 enum Overlay {
@@ -200,7 +212,14 @@ async fn attach(
     terminal::enable_raw_mode()?;
     execute!(std::io::stdout(), terminal::EnterAlternateScreen)?;
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
-    let input = Input::new(cwd.clone(), config.keys.clone(), config.general.default_profile.clone());
+    let mouse_on = config.general.mouse;
+    if mouse_on {
+        let mut out = std::io::stdout();
+        out.write_all(mouse::ENABLE.as_bytes())?;
+        out.flush()?;
+    }
+    let mut input = Input::new(cwd.clone(), config.keys.clone(), config.general.default_profile.clone());
+    input.mouse = mouse_on;
     let hostname = render::hostname();
     let (bg_tx, mut bg_rx) = unbounded_channel::<panel::Bg>();
     let panel = Panel::new(config.panel.visible);
@@ -217,6 +236,11 @@ async fn attach(
         cwd: cwd.clone(),
         new_session_profile,
         bg: bg_tx,
+        copy: None,
+        drag: None,
+        drag_start: (0, 0),
+        have_history: HashSet::new(),
+        outbox: Vec::new(),
     };
     // Redraw at least every second so the clock segment stays current.
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -233,6 +257,9 @@ async fn attach(
                     app.flash = None;
                 }
                 for msg in app.input.feed(&bytes) {
+                    write_msg(&mut wr, &msg).await?;
+                }
+                for msg in app.on_events() {
                     write_msg(&mut wr, &msg).await?;
                 }
                 if let Some(f) = app.input.flash.take() {
@@ -269,10 +296,16 @@ async fn attach(
         if let Some(reason) = exit {
             break reason;
         }
+        for msg in std::mem::take(&mut app.outbox) {
+            write_msg(&mut wr, &msg).await?;
+        }
         term.draw(|f| render::draw(&app, f))?;
     };
 
     terminal::disable_raw_mode()?;
+    if mouse_on {
+        print!("{}", mouse::DISABLE);
+    }
     execute!(std::io::stdout(), terminal::LeaveAlternateScreen)?;
     println!("[oUI: {reason}]");
     // The stdin thread is blocked on read; exit instead of joining it.
@@ -287,16 +320,42 @@ impl App {
                 self.layout = Some(l);
             }
             ServerMsg::Snapshot { pane, rows, cols, data } => {
-                let mut p = vt100::Parser::new(rows, cols, 0);
+                // Keep scrollback locally too, so history grows with output.
+                let mut p = vt100::Parser::new(rows, cols, self.config.general.scrollback);
                 p.process(&data);
                 self.screens.insert(pane, p);
+                self.have_history.remove(&pane);
+                // Size changed under copy mode: positions are meaningless now.
+                if self.copy.as_ref().is_some_and(|c| c.pane == pane) {
+                    self.exit_copy();
+                }
+            }
+            ServerMsg::History { pane, rows, cols, history, data } => {
+                let mut p = vt100::Parser::new(rows, cols, self.config.general.scrollback.max(history as usize));
+                p.process(&data);
+                let old = self.screens.insert(pane, p);
+                self.have_history.insert(pane);
+                if let (Some(c), Some(mut old)) = (self.copy.as_mut().filter(|c| c.pane == pane), old) {
+                    let old_off = old.screen().scrollback();
+                    let old_hist = crate::scrollback::history_len(old.screen_mut());
+                    if let Some(p) = self.screens.get_mut(&pane) {
+                        c.on_history(p, old_hist, old_off);
+                    }
+                    for k in std::mem::take(&mut c.queued) {
+                        self.copy_key(&k);
+                    }
+                }
             }
             ServerMsg::Output { pane, data } => {
                 if let Some(p) = self.screens.get_mut(&pane) {
                     p.process(&data);
+                    if let Some(c) = self.copy.as_mut().filter(|c| c.pane == pane) {
+                        c.sync(p);
+                    }
                 }
             }
             ServerMsg::Sessions(list) => self.panel.sessions = list,
+            ServerMsg::Clipboard(b64) => clipboard::copy_from_app(&b64),
             ServerMsg::Error(e) => self.flash = Some(e),
             _ => {}
         }
@@ -340,16 +399,33 @@ impl App {
     fn close_overlay(&mut self) {
         self.overlay = None;
         self.panel.focused = false;
-        self.input.mode = Mode::Normal;
+        // Input may have moved on already (the prefix after an overlay key in
+        // the same read): only leave the overlay's own mode.
+        if matches!(self.input.mode, Mode::Overlay) {
+            self.input.mode = Mode::Normal;
+        }
     }
 
     /// Handle client-side events from the last input, then refresh the panel
     /// if due. Returns messages for the daemon.
     fn update(&mut self) -> Vec<ClientMsg> {
         let mut out = Vec::new();
+        // The panel was focused when the prefix left it: `prefix Tab` toggles.
+        let mut left_panel = false;
         for ev in std::mem::take(&mut self.input.ui) {
             match ev {
-                UiEvent::Action(a) => self.on_action(a, &mut out),
+                UiEvent::Leave => {
+                    left_panel = matches!(self.overlay, Some(Overlay::Panel));
+                    self.close_overlay();
+                }
+                UiEvent::Action(a) => {
+                    if a == Action::FocusPanel && left_panel {
+                        self.close_overlay();
+                    } else {
+                        self.on_action(a, &mut out);
+                    }
+                    left_panel = false;
+                }
                 UiEvent::Key(k) => match self.overlay {
                     Some(_) => self.overlay_key(&k, &mut out),
                     // The overlay closed earlier in this read: the key is the pane's.
@@ -381,6 +457,11 @@ impl App {
     }
 
     fn on_action(&mut self, action: Action, out: &mut Vec<ClientMsg>) {
+        if matches!(action, Action::FocusPanel | Action::SessionPicker | Action::RenameTab) {
+            // An earlier key of the same read may have closed another overlay.
+            self.input.mode = Mode::Overlay;
+            self.exit_copy();
+        }
         match action {
             Action::TogglePanel => {
                 let visible = !self.panel.visible;
@@ -496,6 +577,26 @@ impl App {
             }
             _ => {}
         }
+    }
+    /// Drain the input events `Input::feed` queued (copy keys, mouse).
+    fn on_events(&mut self) -> Vec<ClientMsg> {
+        let mut out = Vec::new();
+        for ev in std::mem::take(&mut self.input.events) {
+            match ev {
+                input::Event::EnterCopy => {
+                    let focused = self.layout.as_ref().and_then(|l| l.tabs.get(l.active)).map(|t| t.focused);
+                    match focused {
+                        Some(pane) => self.enter_copy(pane, false),
+                        None => self.input.mode = Mode::Normal,
+                    }
+                }
+                input::Event::ExitCopy => self.exit_copy(), // input is in prefix mode already
+                input::Event::CopyKey(k) => self.copy_key(&k),
+                input::Event::Mouse(ev) => out.extend(self.on_mouse(ev)),
+            }
+        }
+        out.append(&mut self.outbox);
+        out
     }
 }
 
