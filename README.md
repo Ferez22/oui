@@ -37,6 +37,28 @@ oui shell work            # plain shell in a profile, no TUI
 oui run work -- railway whoami
 ```
 
+## Workspaces
+Declare a session in `~/.oui/workspaces/<name>.toml`: tabs, each tab's profile and directory, and its split panes with startup commands.
+```toml
+name = "api"
+cwd = "~/code/api"
+[[tab]]
+profile = "work"
+layout = { split = "right", panes = [
+  { cmd = "claude" },
+  { split = "down", panes = [{ cmd = "railway logs" }, { cmd = "npm run dev" }] },
+] }
+[[tab]]
+profile = "personal"
+```
+```bash
+oui workspace new api          # commented template to edit
+oui open api                   # create the session, or attach if it's running
+oui workspace list
+oui workspace save main api    # save a running session's layout
+```
+Commands are typed into the pane's shell, so the shell stays when they exit. Details: [docs/workspaces.md](docs/workspaces.md).
+
 ## Config
 `~/.oui/config.toml` (all keys optional): prefix and key bindings, theme (`default`, `nord`, `light` or your own in `~/.oui/themes/`), status bar segments, right panel, default profile, shell, scrollback.
 ```bash

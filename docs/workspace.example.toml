@@ -1,0 +1,35 @@
+# Example oUI workspace. Copy to ~/.oui/workspaces/api.toml, then: oui open api
+# Format reference: docs/workspaces.md
+
+# Session name (default: the file name). `oui open` attaches if it's running.
+name = "api"
+
+# Default directory for every tab (`~` = your real home).
+cwd = "~/code/api"
+
+# Tab 1: the "work" profile — its logins (claude, railway, gh, ...) are used.
+#
+#   ┌──────────┬──────────────┐
+#   │          │ railway logs │
+#   │  claude  ├──────────────┤
+#   │          │ npm run dev  │
+#   └──────────┴──────────────┘
+[[tab]]
+profile = "work"
+layout = { split = "right", ratio = 0.5, panes = [
+  { cmd = "claude" },
+  { split = "down", panes = [
+    { cmd = "railway logs" },
+    { cmd = "npm run dev", cwd = "web" },   # relative to the tab's cwd
+  ] },
+] }
+
+# Tab 2: the "personal" profile, a single plain shell in another directory.
+[[tab]]
+profile = "personal"
+cwd = "~/code/side-project"
+
+# Tab 3: three shells stacked with equal heights, no isolation.
+[[tab]]
+profile = "system"
+layout = { split = "down", panes = [{}, {}, {}] }

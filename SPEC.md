@@ -79,12 +79,15 @@ An **isolation test suite** runs each supported tool in two profiles and checks 
 - Prefix key (default `Ctrl-b`), configurable. Default keys after the prefix: `c` new tab, `n`/`p`/`1-9` switch tab, `%`/`|` split right, `"`/`-` split down, arrows/`hjkl` focus, `HJKL` resize, `z` zoom, `x` close pane, `&` close tab, `d` detach, `b` right panel, `[` copy mode, `s` session picker, `,` rename tab; prefix twice sends it to the pane.
 - Detach (`prefix d`) / attach (`oui attach <session>`). Shells survive client exit.
 - Session manager UI: list, rename, kill, switch.
-- **Workspaces**: layout files declaring tabs, panes, profile, cwd, startup command:
+- **Workspaces** (`~/.oui/workspaces/<name>.toml`, see [docs/workspaces.md](docs/workspaces.md)): layout files declaring tabs, profile, cwd, a nested split tree, and startup commands (typed into the pane's shell). `oui open <name|path>` creates the session or attaches if running; `oui workspace list | new | save`.
   ```toml
   [[tab]]
   profile = "work"
   cwd = "~/code/api"
-  panes = [{ cmd = "claude" }, { cmd = "railway logs" }, { cmd = "npm run dev", split = "down" }]
+  layout = { split = "right", panes = [
+    { cmd = "claude" },
+    { split = "down", panes = [{ cmd = "railway logs" }, { cmd = "npm run dev" }] },
+  ] }
   ```
 - Resurrection after reboot (relaunch commands in saved cwd): v2.
 
@@ -116,6 +119,8 @@ oui profile list | share <name> true|false | rm <name>
 oui shell <name>            # plain shell in a profile, no TUI
 oui run <name> -- <cmd>     # one command in a profile (scripts, CI)
 oui attach [session] | ls | kill <session>
+oui open <workspace|path>   # create-or-attach a workspace session
+oui workspace list | new <name> | save <session> [name] [--force]
 ```
 
 ## Roadmap

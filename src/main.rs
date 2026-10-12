@@ -7,6 +7,7 @@ mod daemon;
 mod layout;
 mod profile;
 mod protocol;
+mod workspace;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -56,12 +57,36 @@ enum Cmd {
     Env { name: String },
     /// Show which CLI tools are logged in for a profile (default: system)
     Accounts { profile: Option<String> },
+    /// Open a workspace by name (~/.oui/workspaces/<name>.toml) or path;
+    /// attaches if its session is already running
+    Open { workspace: String },
+    /// Manage workspace files
+    #[command(subcommand, alias = "ws")]
+    Workspace(WorkspaceCmd),
     /// Config file (~/.oui/config.toml)
     #[command(subcommand)]
     Config(ConfigCmd),
     /// Run the server (started automatically)
     #[command(hide = true)]
     Daemon,
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCmd {
+    /// List workspaces in ~/.oui/workspaces
+    #[command(alias = "ls")]
+    List,
+    /// Create a commented workspace file to edit
+    New { name: String },
+    /// Save a running session's layout (profiles, splits, directories) as a workspace
+    Save {
+        session: String,
+        /// Workspace name (default: the session name)
+        name: Option<String>,
+        /// Overwrite an existing workspace file
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -117,6 +142,12 @@ fn main() -> Result<()> {
         Some(Cmd::Kill { session }) => rt()?.block_on(client::request(ClientMsg::KillSession(session))),
         Some(Cmd::KillServer) => rt()?.block_on(client::request(ClientMsg::KillServer)),
         Some(Cmd::Daemon) => daemon::run(),
+        Some(Cmd::Open { workspace }) => rt()?.block_on(workspace::open(&workspace)),
+        Some(Cmd::Workspace(WorkspaceCmd::List)) => workspace::list(),
+        Some(Cmd::Workspace(WorkspaceCmd::New { name })) => workspace::new(&name),
+        Some(Cmd::Workspace(WorkspaceCmd::Save { session, name, force })) => {
+            rt()?.block_on(workspace::save(&session, name.as_deref(), force))
+        }
         Some(Cmd::Config(ConfigCmd::Path)) => {
             println!("{}", config::path()?.display());
             Ok(())
