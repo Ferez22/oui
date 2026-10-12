@@ -184,7 +184,6 @@ impl App {
             .clone()
             .find(|p| x >= p.rect.x && y >= p.rect.y && x < p.rect.x + p.rect.cols && y < p.rect.y + p.rect.rows)
             .map(|p| (p.id, p.rect));
-        let focused = tab.focused;
         // A drag stays with the pane it started in (coordinates clamped).
         let captured = match self.drag {
             Some(Drag::App(id) | Drag::Select { pane: id, .. }) => tab.panes.iter().find(|p| p.id == id).map(|p| (id, p.rect)),
@@ -226,9 +225,9 @@ impl App {
                 if self.copy.is_some() {
                     self.exit_copy();
                 }
-                if pane != focused {
-                    out.push(ClientMsg::FocusPane(pane));
-                }
+                // Always ask: our idea of the focused pane can be one layout
+                // update behind after quick clicks (focusing is idempotent).
+                out.push(ClientMsg::FocusPane(pane));
                 self.enter_copy(pane, true);
                 self.copy_scroll(WHEEL_LINES);
             }
@@ -239,9 +238,7 @@ impl App {
             if self.copy.as_ref().is_some_and(|c| c.pane != pane) {
                 self.exit_copy();
             }
-            if pane != focused {
-                out.push(ClientMsg::FocusPane(pane));
-            }
+            out.push(ClientMsg::FocusPane(pane));
             if app_mouse {
                 forward(&mut out);
                 self.drag = Some(Drag::App(pane));
