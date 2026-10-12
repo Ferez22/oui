@@ -82,10 +82,8 @@ pub fn write_config(result: &ImportResult, force: bool) -> Result<PathBuf> {
             path.display()
         );
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    }
-    std::fs::write(&path, &result.toml).with_context(|| format!("write {}", path.display()))?;
+    crate::profile::ensure_root()?;
+    crate::profile::write_private(&path, result.toml.as_bytes())?;
     Ok(path)
 }
 

@@ -35,16 +35,18 @@ The daemon keeps shells alive when clients disconnect (tmux model). Clients are 
 
 Layout:
 ```
-~/.oui/
-  config.toml
+~/.oui/                 # 0700, must belong to the user ($OUI_HOME too; refused otherwise)
+  config.toml           # 0600, like daemon.log, workspaces/*.toml, profile.toml
   profiles/<name>/
-    profile.toml        # name, color, shared, keychain, protected
+    profile.toml        # name, color, shared, extra_shared, keychain, protected
     keychain.pw         # macOS, keychain = "file" only (0600)
+    bin/ssh             # only when home/.ssh/config exists: ssh wrapper (see adapters)
     home/               # the profile's HOME
       .config/ .local/share/ .local/state/ .cache/ .claude/ ...
-      Library/Keychains/oui.keychain-db    # macOS: the profile keychain
+      Library/Keychains/oui.keychain-db    # macOS: the profile keychain (0600)
       Library/Keychains/login.keychain-db  # symlink to it (makes it the default)
 ```
+Every folder oUI creates there is 0700 (root, `profiles/`, the profile, its HOME, `Library`, `Library/Keychains`): a real macOS `~/Library` is 0700, and the profile HOME stands in for it. Each spawn tightens these folders (and `profile.toml`, the keychain file) if an older version left them more open; symlinks are never followed.
 
 Every process in a profile gets:
 
@@ -56,11 +58,16 @@ Every process in a profile gets:
 | `GH_CONFIG_DIR` | `home/.config/gh` | gh adapter (explicit) |
 | `OUI_PROFILE`, `OUI_PROFILE_COLOR`, `OUI_REAL_HOME` | — | Prompt/Starship integration, tooling |
 | `TERM` | `xterm-256color` | Works on every server (fixes nano/vim over ssh) |
+| `PATH`, `GIT_SSH_COMMAND`, `OUI_PROFILE_BIN` | `profiles/<name>/bin` first; its `ssh` | Only when the profile has `home/.ssh/config` (ssh adapter). Other profiles' `bin` folders are always removed from `PATH`. |
 
-Removed from the environment so they can't override profile logins: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `RAILWAY_TOKEN`, `RAILWAY_API_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`, `VERCEL_TOKEN` (list grows with adapters).
+Removed from the environment so they can't override profile logins (`profile::CREDENTIAL_VARS`, list grows with adapters): `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `RAILWAY_TOKEN`, `RAILWAY_API_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`, `VERCEL_TOKEN`, `NPM_TOKEN`, `FLY_ACCESS_TOKEN`, `FLY_API_TOKEN`, `SUPABASE_ACCESS_TOKEN`, `STRIPE_API_KEY`, `NETLIFY_AUTH_TOKEN`, `AWS_*` credentials/profile/config paths, `DOCKER_CONFIG`, `GIT_CONFIG_GLOBAL`, `CARGO_HOME`, `CARGO_REGISTRY_TOKEN`, `KUBECONFIG`, `GOOGLE_APPLICATION_CREDENTIALS`, `CLOUDSDK_CONFIG`, `AZURE_CONFIG_DIR`; plus every `CARGO_REGISTRIES_*_TOKEN` and every `npm_config_*` (any case) naming an auth token, `userconfig` or `globalconfig`. Shell rc files run after this and can re-export variables (see Shared).
 
 ### Shared vs fresh
-- **Shared** (default): non-credential dotfiles and toolchains are symlinked from the real HOME (`.zshrc`, `.oh-my-zsh`, `.nvm`, `.cargo`, `starship.toml`, …). Allowlist only — credential locations are never linked.
+- **Shared** (default): non-credential dotfiles and toolchains are symlinked from the real HOME (`.zshrc`, `.oh-my-zsh`, `.nvm`, `.rustup`, `starship.toml`, …). Allowlist only — credential locations are never linked.
+  - Folders mixing toolchain and credentials (`SHARED_PARTS`) get a real per-profile folder (0700) with links to their credential-free parts only: `.cargo/{bin,env,env.fish,env.nu}`. `cargo login` therefore writes the profile's own `.cargo/credentials.toml`. Cargo's `config.toml` (can hold tokens) and its `registry/`/`git/` caches (locked through a file in the cargo home, so not safely shareable between cargo homes) stay per profile.
+  - Migration: profiles from older versions have `home/.cargo` → real `~/.cargo`. At the next spawn that symlink (only one pointing at the real `~/.cargo`) is removed, never followed, and the folder is rebuilt; the real `~/.cargo` is untouched. A login made in such a profile before the upgrade stays in the real `~/.cargo`.
+  - Linked files are still the user's: tokens exported from shared rc files, and fish universal variables (`set -Ux`, stored in the linked `.config/fish/fish_variables`), reach every shared profile.
+  - `extra_shared` (profile.toml): extra paths relative to HOME. Absolute paths, `.`/`..` components and anything at or under `Library/Keychains` (case-insensitive) are refused.
 - **Fresh**: empty home.
 - Toggle anytime (`oui profile share <name> true|false`). Unsharing removes only oUI's symlinks; profile logins are kept. UI warns before toggling.
 
@@ -69,13 +76,13 @@ Removed from the environment so they can't override profile logins: `ANTHROPIC_A
 |---|---|---|
 | macOS Keychain | Claude Code, gh (keyring), git-credential-osxkeychain, anything using the default keychain | **Per-profile keychain** (below) — no per-tool code. |
 | Linux Secret Service | some CLIs (gh, supabase keyring mode) | Out of scope for v1 (most Linux CLIs fall back to files, which HOME/XDG isolate). |
-| Ignores `HOME` (uses passwd entry) | `ssh` | Per-profile `ssh` wrapper on PATH adding `-F <profile>/home/.ssh/config` when present |
-| git identity | git | `GIT_CONFIG_GLOBAL` → profile `.gitconfig` (which can `[include]` the shared one) |
+| Ignores `HOME` (uses passwd entry) | `ssh` | When `home/.ssh/config` exists, each spawn writes `profiles/<name>/bin/ssh` (0700 folder): `exec <real ssh> -F <profile>/home/.ssh/config "$@"`, the real ssh being the first non-wrapper `ssh` on PATH (else `/usr/bin/ssh`). That folder goes first on `PATH`, `GIT_SSH_COMMAND` points at the wrapper (git always uses it) and `OUI_PROFILE_BIN` names the folder. macOS login shells run `path_helper`, which moves system dirs ahead of it; the README gives a one-line `.zshrc` fix for typing `ssh`. No config: no wrapper (removed if present), ssh untouched. The ssh agent and `~/.ssh/known_hosts` stay shared. |
+| git identity | git | `~/.gitconfig` in the profile HOME (not linked); `GIT_CONFIG_GLOBAL` is removed so it can't point back at the real one |
 
 #### Per-profile macOS keychain
 macOS resolves a process's default keychain through `$HOME` (`~/Library/Keychains/login.keychain-db`). Each profile home therefore gets `Library/Keychains/oui.keychain-db` plus a `login.keychain-db` symlink to it, and every tool in the profile that stores secrets in "the keychain" stores them there — isolated from other profiles and from the real login keychain, with no per-tool code. (The file isn't itself named `login.keychain-db`: securityd treats a keychain with that name as the account's login keychain and won't unlock it with its own password.)
 
-- **Password**: 32 random bytes (hex), generated by oUI. Never on a command line (creation goes through `security -i` stdin, unlock through the Security framework), never logged; zeroized in memory where practical.
+- **Password**: 32 random bytes (hex), generated by oUI. Never on a command line (creation goes through `security -i` stdin, unlock through the Security framework), never logged; zeroized in memory where practical. A stored password is used only if it is exactly 64 lowercase hex digits. A new keychain (no keychain file yet) always gets a freshly generated password, replacing whatever the store held. `keychain.pw` is opened with `O_NOFOLLOW` (read and write) and must be a regular file owned by the user. An existing `login.keychain-db` symlink is trusted only if it points to `oui.keychain-db`.
 - **Mode** (`keychain` in `profile.toml`, chosen at `oui profile new` — interactive prompt on a TTY, or `--keychain secure|file`):
   - `secure` (default): password stored as a generic password item (service `oUI profile keychain`, account = profile name) in the **real** login keychain, opened by explicit path from the real HOME. Encrypted at rest; macOS may ask once to let `oui` read the item ("Always Allow"; again after `oui` is rebuilt/upgraded, since unsigned binaries change identity).
   - `file`: password in `profiles/<name>/keychain.pw` (0600). No prompts; protection equals plaintext token files.

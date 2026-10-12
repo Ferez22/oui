@@ -43,9 +43,13 @@ pub async fn connect(spawn: bool) -> Result<UnixStream> {
     if !spawn {
         bail!("no oUI server running");
     }
-    let root = profile::oui_root()?;
-    std::fs::create_dir_all(&root)?;
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(root.join("daemon.log"))?;
+    let root = profile::ensure_root()?; // 0700, and must be ours
+    let log = {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let log = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(root.join("daemon.log"))?;
+        log.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        log
+    };
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("daemon").stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
     // Started from inside a profile shell: give the daemon the real environment
@@ -612,10 +616,8 @@ impl App {
             }
             b"d" | b"D" => {
                 let written = config::path().and_then(|p| {
-                    if let Some(dir) = p.parent() {
-                        std::fs::create_dir_all(dir)?;
-                    }
-                    std::fs::write(&p, NO_IMPORT_CONFIG)?;
+                    profile::ensure_root()?;
+                    profile::write_private(&p, NO_IMPORT_CONFIG.as_bytes())?;
                     Ok(p)
                 });
                 self.flash = Some(match written {
