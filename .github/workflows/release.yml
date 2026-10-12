@@ -1,0 +1,78 @@
+name: release
+
+# Builds prebuilt binaries for every pushed `v*` tag, attaches them to the
+# GitHub release, and (if HOMEBREW_TAP_TOKEN is set) updates the formula in
+# Ferez22/homebrew-tap so `brew install ferez22/tap/oui` gets the new version.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
+      - name: Test
+        run: cargo test --locked --release --target ${{ matrix.target }}
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name="oui-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/oui" README.md LICENSE-MIT LICENSE-APACHE "$name/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" | awk '{print $1}' > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oui-${{ matrix.target }}
+          path: oui-${{ matrix.target }}.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 --title "oUI $GITHUB_REF_NAME" --generate-notes --verify-tag
+      - name: Render Homebrew formula
+        run: scripts/render-formula.sh "${GITHUB_REF_NAME#v}" dist > oui.rb && cat oui.rb
+      - name: Update tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        if: env.TAP_TOKEN != ''
+        run: |
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/Ferez22/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp oui.rb tap/Formula/oui.rb
+          cd tap
+          git config user.name "oui-release-bot"
+          git config user.email "oui-release-bot@users.noreply.github.com"
+          git add Formula/oui.rb
+          git commit -m "oui ${GITHUB_REF_NAME}"
+          git push
