@@ -190,6 +190,7 @@ fn lock(state: &Shared) -> MutexGuard<'_, State> {
 }
 
 pub fn run() -> Result<()> {
+    profile::ensure_root()?; // 0700 (also tightens roots made by older versions)
     tokio::runtime::Runtime::new()?.block_on(serve())
 }
 

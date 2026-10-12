@@ -56,7 +56,9 @@ Command-line tools save their logins in your home folder (`~/.railway`, `~/.conf
 | macOS keychain (Claude Code, gh, git…) | ✅ its own keychain | |
 | **Claude Code chat history** (`claude --resume`) | ✅ each profile has its own | |
 | Shell history | ✅ | |
-| Shell config, prompt, toolchains (`.zshrc`, `.p10k.zsh`, `.oh-my-zsh`, `.nvm`…) | | ✅ linked, unless the profile was created with `--fresh` |
+| cargo login (`~/.cargo/credentials.toml`) | ✅ each profile has its own `~/.cargo` | `~/.cargo/bin` and `~/.cargo/env` are linked |
+| ssh keys | ✅ once the profile has its own `~/.ssh/config` ([how](#a-different-ssh-key-per-profile-eg-github)) | otherwise ssh uses your normal keys |
+| Shell config, prompt, toolchains (`.zshrc`, `.p10k.zsh`, `.oh-my-zsh`, `.nvm`, `.rustup`…) | | ✅ linked, unless the profile was created with `--fresh` |
 
 - `oui profile new <name>` creates a **shared** profile: your shell setup is linked in, logins are not.
 - `oui profile new <name> --fresh` creates an **empty** profile: nothing linked.
@@ -70,9 +72,33 @@ oui run work -- railway whoami   # one command in a profile
 oui profile rm work              # delete a profile and its logins (asks you to type its name)
 ```
 
-To share more of your own files into a profile, list them in `~/.oui/profiles/<name>/profile.toml`:
+To share more of your own files into a profile, list them in `~/.oui/profiles/<name>/profile.toml` (paths relative to your home, without `..`; `Library/Keychains` can't be shared):
 ```toml
 extra_shared = [".config/foo"]
+```
+
+A profile's folders are private to you: `~/.oui` and the folders in it are mode 0700 and its files 0600, like the `~/Library` they stand in for. Folders made by older versions are tightened the next time a shell starts in the profile.
+
+In a shared profile, cargo's own settings (`~/.cargo/config.toml`) aren't linked because they can hold registry tokens, and downloaded crates are kept per profile. Copy the config into the profile's `~/.cargo` if you need it.
+
+### A different ssh key per profile (e.g. GitHub)
+`ssh` ignores the profile's home folder, so by default every profile uses your normal ssh keys (and pushes to GitHub as the same user). To give a profile its own key:
+
+```bash
+oui shell work
+mkdir -m 700 -p ~/.ssh
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519      # ~ is the profile's home here
+cat >> ~/.ssh/config <<EOF
+Host github.com
+  IdentityFile $HOME/.ssh/id_ed25519
+  IdentitiesOnly yes
+EOF
+```
+(`$HOME` is written out as the full path on purpose: ssh would read `~` as your normal home.) Add `~/.ssh/id_ed25519.pub` to the GitHub account, then open a new tab in the profile.
+
+From then on, shells in that profile get an `ssh` wrapper that uses this config (`ssh -F <profile>/home/.ssh/config`), and git uses it for every push and pull (`GIT_SSH_COMMAND`). On macOS, login shells reorder `PATH` (`/etc/zprofile`), which puts the system `ssh` ahead of the wrapper when you type `ssh` yourself. Add this line to your `~/.zshrc` (it does nothing outside profiles):
+```bash
+if [ -n "$OUI_PROFILE_BIN" ]; then export PATH="$OUI_PROFILE_BIN:$PATH"; fi
 ```
 
 ### The keychain password prompt
@@ -214,7 +240,13 @@ cp -R ~/.claude/projects/<folder-name>/. ~/.oui/profiles/<profile>/home/.claude/
 ## Limitations
 
 - **Profiles separate accounts; they are not a sandbox.** All profiles run as your macOS user, so a program in one profile could still read another profile's files if it went looking. The goal is that your tools never mix up accounts, not to contain malicious software.
-- **Linux:** logins stored in files are isolated per profile, but logins stored in the Linux Secret Service (GNOME Keyring/KWallet) are not yet.
+- **Still shared between profiles** (these don't go through the home folder):
+  - the **ssh agent** (`SSH_AUTH_SOCK`): keys added with `ssh-add` are offered in every profile unless the profile's `~/.ssh/config` says `IdentitiesOnly yes`. `~/.ssh/known_hosts` is your normal one.
+  - the **GPG agent** and its keys (signed commits).
+  - **macOS app preferences** (`defaults`, apps' settings) and anything else that talks to a background service of your user.
+  - on Linux, the **Secret Service** (GNOME Keyring/KWallet).
+  - your **linked shell config**: a token exported in `.zshrc` (or a fish universal variable, `set -Ux`) reaches every shared profile. oUI removes known token variables (`GH_TOKEN`, `CARGO_REGISTRY_TOKEN`, `NPM_TOKEN`…) when it starts a shell, but your shell config runs after that.
+- **Linux:** logins stored in files are isolated per profile, but logins stored in the Linux Secret Service are not yet (see above).
 - Sessions don't survive a reboot (use workspaces).
 
 ---

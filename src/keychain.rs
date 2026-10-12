@@ -19,7 +19,10 @@
 //! - `file`: a 0600 file `keychain.pw` in the profile directory. No prompts;
 //!   protection equals a plaintext token file.
 //!
-//! Passwords never go on a command line and are never logged or printed.
+//! Passwords never go on a command line and are never logged or printed. A
+//! stored password is only used if it looks like one oUI made (64 lowercase
+//! hex digits), and a new keychain always gets a newly generated password.
+//! The keychain file is 0600, in 0700 folders.
 //!
 //! On other platforms everything here is a no-op: Linux CLIs keep logins in
 //! files (isolated by HOME/XDG) or the Secret Service, which is out of scope.
@@ -142,8 +145,8 @@ mod imp {
     use security_framework::os::macos::keychain::{KeychainSettings, SecKeychain};
     use std::collections::HashSet;
     use std::fs;
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::process::{Command, Stdio};
     use std::sync::{Mutex, mpsc};
     use zeroize::Zeroizing;
@@ -199,7 +202,15 @@ mod imp {
         let path = keychain_path(&home);
         let link = login_keychain_path(&home);
         let link_ok = match fs::symlink_metadata(&link) {
-            Ok(m) if m.file_type().is_symlink() => true,
+            Ok(m) if m.file_type().is_symlink() => {
+                if fs::read_link(&link)? != Path::new(KEYCHAIN_FILE) {
+                    bail!(
+                        "{} doesn't point to {KEYCHAIN_FILE}; move it away so the profile keychain can be used",
+                        link.display()
+                    );
+                }
+                true
+            }
             Ok(_) => bail!(
                 "{} exists and isn't oUI's; move it away so the profile keychain can be used",
                 link.display()
@@ -207,6 +218,7 @@ mod imp {
             Err(_) => false,
         };
         if path.exists() {
+            profile::tighten(&path, 0o600)?;
             if !link_ok {
                 std::os::unix::fs::symlink(KEYCHAIN_FILE, &link)?;
             }
@@ -225,15 +237,11 @@ mod imp {
             kc.set_settings(&no_autolock())?;
             return Ok(());
         }
-        // Store the password before creating the keychain: never a keychain without one.
-        let pw = match load(p, mode)? {
-            Some(pw) => pw,
-            None => {
-                let pw = generate()?;
-                store(p, mode, &pw)?;
-                pw
-            }
-        };
+        // A new keychain always gets a new password (never one already found in
+        // a store, which may be stale or not oUI's). Store it before creating
+        // the keychain: never a keychain without its password.
+        let pw = generate()?;
+        store(p, mode, &pw)?;
         create(&home, &path, &pw)?;
         if !link_ok {
             std::os::unix::fs::symlink(KEYCHAIN_FILE, &link)?;
@@ -310,7 +318,10 @@ mod imp {
     /// then see profile secrets).
     fn create(home: &Path, path: &Path, pw: &str) -> Result<()> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            profile::private_dir(parent)?;
+        }
+        if !is_valid_password(pw) {
+            bail!("refusing a malformed profile keychain password");
         }
         let p = path.to_str().context("profile keychain path is not UTF-8")?;
         if p.contains(['"', '\\', '\n']) {
@@ -334,6 +345,7 @@ mod imp {
         if !out.status.success() || !path.exists() || !err.trim().is_empty() {
             bail!("create profile keychain: {}", err.trim());
         }
+        profile::tighten(path, 0o600)?;
         let mut kc = SecKeychain::open(path)?;
         kc.unlock(Some(pw)).context("unlock new profile keychain")?;
         kc.set_settings(&no_autolock())?;
@@ -351,34 +363,64 @@ mod imp {
         Ok(s)
     }
 
+    /// What oUI generates: 64 lowercase hex digits. Anything else is refused
+    /// (the password goes into a `security -i` command line).
+    fn is_valid_password(pw: &str) -> bool {
+        pw.len() == 64 && pw.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
     // ---- password stores ----------------------------------------------------
 
     fn load(p: &Profile, mode: Mode) -> Result<Option<Password>> {
-        match mode {
-            Mode::File => match fs::read_to_string(p.dir.join(PASSWORD_FILE)) {
-                Ok(s) => {
-                    let s = Zeroizing::new(s);
-                    Ok(Some(Zeroizing::new(s.trim().to_string())))
+        let pw = match mode {
+            Mode::File => {
+                let path = p.dir.join(PASSWORD_FILE);
+                // Never through a symlink; only a regular file of ours.
+                let mut f = match fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(&path)
+                {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(e).with_context(|| format!("open {} (it must be a plain file)", path.display())),
+                };
+                let m = f.metadata()?;
+                // SAFETY: geteuid has no preconditions.
+                if !m.is_file() || m.uid() != unsafe { libc::geteuid() } {
+                    bail!("{} must be a plain file owned by you", path.display());
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(e).context("read keychain password file"),
-            },
+                let mut s = Zeroizing::new(String::new());
+                f.read_to_string(&mut s).context("read keychain password file")?;
+                Zeroizing::new(s.trim().to_string())
+            }
             Mode::Secure => match real_login()?.find_generic_password(SERVICE, &account(p)) {
                 Ok((data, _)) => {
                     let s = std::str::from_utf8(&data).context("keychain password is not UTF-8")?;
-                    Ok(Some(Zeroizing::new(s.to_string())))
+                    Zeroizing::new(s.to_string())
                 }
-                Err(e) if e.code() == ERR_ITEM_NOT_FOUND => Ok(None),
-                Err(e) => Err(e).context("read profile keychain password from your login keychain"),
+                Err(e) if e.code() == ERR_ITEM_NOT_FOUND => return Ok(None),
+                Err(e) => return Err(e).context("read profile keychain password from your login keychain"),
             },
+        };
+        if !is_valid_password(&pw) {
+            bail!("the profile keychain password in the {} store isn't one oUI made (64 hex digits)", mode.label());
         }
+        Ok(Some(pw))
     }
 
     fn store(p: &Profile, mode: Mode, pw: &str) -> Result<()> {
         match mode {
             Mode::File => {
                 let path = p.dir.join(PASSWORD_FILE);
-                let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
+                let mut f = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&path)
+                    .with_context(|| format!("write {} (it must be a plain file)", path.display()))?;
                 f.set_permissions(fs::Permissions::from_mode(0o600))?;
                 f.write_all(pw.as_bytes())?;
                 Ok(())
@@ -465,6 +507,45 @@ mod imp {
             assert_eq!(a.len(), 64);
             assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
             assert_ne!(*a, *b);
+        }
+
+        #[test]
+        fn only_generated_looking_passwords_are_accepted() {
+            assert!(is_valid_password(&generate().unwrap()));
+            assert!(!is_valid_password(""));
+            assert!(!is_valid_password(&"A".repeat(64)));
+            assert!(!is_valid_password(&format!("{}\" \"/tmp/x", "a".repeat(58))));
+            assert!(!is_valid_password(&"a".repeat(65)));
+        }
+
+        #[test]
+        fn file_password_is_validated_and_never_read_through_a_symlink() {
+            let t = tmp("pwfile");
+            let p = Profile { name: "t", dir: &t.0 };
+            let path = t.0.join(PASSWORD_FILE);
+            fs::write(&path, "x\" \"; rm -rf /tmp/never\n").unwrap();
+            assert!(load(&p, Mode::File).is_err());
+            let good = "ab".repeat(32);
+            fs::write(&path, format!("{good}\n")).unwrap();
+            assert_eq!(load(&p, Mode::File).unwrap().unwrap().as_str(), good);
+            fs::remove_file(&path).unwrap();
+            let target = t.0.join("elsewhere");
+            fs::write(&target, &good).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert!(load(&p, Mode::File).is_err(), "load follows a symlink");
+            assert!(store(&p, Mode::File, &good).is_err(), "store follows a symlink");
+        }
+
+        #[test]
+        fn foreign_login_keychain_link_is_refused() {
+            let t = tmp("link");
+            let p = Profile { name: "t", dir: &t.0 };
+            let kc = p.home().join("Library/Keychains");
+            fs::create_dir_all(&kc).unwrap();
+            std::os::unix::fs::symlink("/tmp/not-oui.keychain-db", kc.join("login.keychain-db")).unwrap();
+            let e = ensure_now(&p, Mode::File).unwrap_err();
+            assert!(format!("{e:#}").contains("doesn't point to oui.keychain-db"), "{e:#}");
+            assert!(!t.0.join(PASSWORD_FILE).exists());
         }
 
         #[test]

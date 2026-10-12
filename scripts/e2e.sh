@@ -476,6 +476,105 @@ if [ "$(uname)" = Darwin ]; then
     if security list-keychains -d user | grep -q "$OUI_HOME/profiles"; then fail "real search list still clean"; fi
 fi
 
+# ---- Profile files: private modes, own cargo home, ssh wrapper ----
+# Dummy values only; HOME is the fake one, so "real ~/.cargo" is a fake too.
+perm() { if [ "$(uname)" = Darwin ]; then stat -f %Lp "$1"; else stat -c %a "$1"; fi; }
+pd() { echo "$OUI_HOME/profiles/$1"; }
+priv_tree() { # <profile>: the folders around its logins are 0700
+    for d in "$OUI_HOME" "$OUI_HOME/profiles" "$(pd "$1")" "$(pd "$1")/home"; do
+        [ "$(perm "$d")" = 700 ] || fail "$d is 0700 (is $(perm "$d"))"
+    done
+    if [ "$(uname)" = Darwin ]; then
+        for d in "$(pd "$1")/home/Library" "$(pd "$1")/home/Library/Keychains"; do
+            [ "$(perm "$d")" = 700 ] || fail "$d is 0700 (is $(perm "$d"))"
+        done
+        [ "$(perm "$(pd "$1")/home/Library/Keychains/oui.keychain-db")" = 600 ] || fail "$1: keychain file is 0600"
+    fi
+    [ "$(perm "$(pd "$1")/profile.toml")" = 600 ] || fail "$1: profile.toml is 0600"
+}
+priv_tree work
+[ "$(perm "$OUI_HOME/daemon.log")" = 600 ] || fail "daemon.log is 0600"
+[ "$(perm "$OUI_HOME/workspaces/saved.toml")" = 600 ] || fail "saved workspace is 0600"
+echo "ok   profile new / workspace save: 0700 folders, 0600 files"
+# Trees made by older versions (umask 0755/0644) are tightened at the next spawn.
+chmod 755 "$OUI_HOME" "$OUI_HOME/profiles" "$(pd work)" "$(pd work)/home"
+chmod 644 "$(pd work)/profile.toml"
+if [ "$(uname)" = Darwin ]; then
+    chmod 755 "$(pd work)/home/Library" "$(pd work)/home/Library/Keychains"
+    chmod 644 "$(pd work)/home/Library/Keychains/oui.keychain-db"
+fi
+"$bin" run work -- true
+priv_tree work
+echo "ok   a 0755 profile tree is tightened to 0700 at spawn"
+# Another user's OUI_HOME is refused (simulated: a root-owned folder).
+if out=$(OUI_HOME=/usr "$bin" run work -- true 2>&1); then fail "foreign OUI_HOME refused"; fi
+echo "$out" | grep -q 'belongs to another user' || fail "foreign OUI_HOME error says why: $out"
+echo "ok   an OUI_HOME owned by another user is refused"
+
+# cargo: a shared profile gets its own ~/.cargo with only bin/env linked.
+mkdir -p "$HOME/.cargo/bin"
+printf '#!/bin/sh\necho FAKE-CARGO-TOOL\n' >"$HOME/.cargo/bin/cargo-dummy"
+chmod +x "$HOME/.cargo/bin/cargo-dummy"
+printf 'export PATH="$HOME/.cargo/bin:$PATH"\n' >"$HOME/.cargo/env"
+echo dummy-real >"$HOME/.cargo/credentials.toml"
+echo '[registries]' >"$HOME/.cargo/config.toml"
+"$bin" profile new cg --keychain file >/dev/null
+out=$("$bin" run cg -- sh -c '. "$HOME/.cargo/env"; cargo-dummy')
+[ "$out" = FAKE-CARGO-TOOL ] || fail "shared profile runs tools from \$HOME/.cargo/bin: $out"
+"$bin" run cg -- sh -c 'test -e "$HOME/.cargo/credentials.toml" || test -e "$HOME/.cargo/config.toml"' \
+    && fail "real cargo credentials/config not visible in the profile"
+"$bin" run cg -- sh -c 'echo dummy-p > $HOME/.cargo/credentials.toml'
+[ "$(cat "$HOME/.cargo/credentials.toml")" = dummy-real ] || fail "real credentials.toml untouched"
+[ "$(cat "$(pd cg)/home/.cargo/credentials.toml")" = dummy-p ] || fail "profile keeps its own credentials.toml"
+[ ! -L "$(pd cg)/home/.cargo" ] && [ "$(perm "$(pd cg)/home/.cargo")" = 700 ] || fail "profile .cargo is its own 0700 folder"
+echo "ok   cargo: \$HOME/.cargo/bin shared, credentials.toml per profile (real one untouched)"
+# Profiles from older versions link the whole real ~/.cargo: migrated at spawn.
+"$bin" profile new cgold --keychain file >/dev/null
+rm "$(pd cgold)/home/.cargo/bin" "$(pd cgold)/home/.cargo/env"
+rmdir "$(pd cgold)/home/.cargo"
+ln -s "$HOME/.cargo" "$(pd cgold)/home/.cargo"
+"$bin" run cgold -- sh -c 'echo dummy-new > $HOME/.cargo/credentials.toml'
+[ ! -L "$(pd cgold)/home/.cargo" ] && [ -L "$(pd cgold)/home/.cargo/bin" ] || fail "old .cargo link replaced by a folder"
+[ "$(cat "$HOME/.cargo/credentials.toml")" = dummy-real ] && [ -x "$HOME/.cargo/bin/cargo-dummy" ] \
+    || fail "migration leaves the real ~/.cargo alone"
+[ "$(cat "$(pd cgold)/home/.cargo/credentials.toml")" = dummy-new ] || fail "migrated profile has its own credentials"
+echo "ok   cargo: an old ~/.cargo link is replaced at spawn (real ~/.cargo untouched)"
+out=$(CARGO_HOME=$HOME/.cargo CARGO_REGISTRY_TOKEN=dummy CARGO_REGISTRIES_CORP_TOKEN=dummy npm_config__authToken=dummy \
+    NPM_CONFIG_USERCONFIG=/x FLY_API_TOKEN=dummy KUBECONFIG=/x GOOGLE_APPLICATION_CREDENTIALS=/x CLOUDSDK_CONFIG=/x \
+    AZURE_CONFIG_DIR=/x KEEP_ME=1 "$bin" run cg -- env)
+if echo "$out" | grep -E '^(CARGO_HOME|CARGO_REGISTR|npm_config|NPM_CONFIG|FLY_API|KUBECONFIG|GOOGLE_APP|CLOUDSDK|AZURE)'; then
+    fail "credential variables are removed in profiles"
+fi
+echo "$out" | grep -q '^KEEP_ME=1$' || fail "other variables are kept"
+echo "ok   credential variables (cargo, npm, fly, kube, gcloud, azure) are removed"
+
+# ssh: only a profile with its own ~/.ssh/config gets the wrapper (-F). A
+# fake ssh first on PATH stands in for the real one: no host is contacted.
+fakessh=$dir/fakessh
+mkdir -p "$fakessh"
+printf '#!/bin/sh\necho "FAKE-SSH $*"\n' >"$fakessh/ssh"
+chmod +x "$fakessh/ssh"
+"$bin" profile new sshp --fresh --keychain file >/dev/null
+"$bin" profile new nossh --fresh --keychain file >/dev/null
+mkdir -m 700 "$(pd sshp)/home/.ssh"
+printf 'Host github.com\n  IdentitiesOnly yes\n' >"$(pd sshp)/home/.ssh/config"
+out=$(PATH=$fakessh:$PATH "$bin" run sshp -- ssh git@github.com)
+[ "$out" = "FAKE-SSH -F $(pd sshp)/home/.ssh/config git@github.com" ] || fail "ssh in a profile with .ssh/config adds -F: $out"
+out=$(PATH=$fakessh:$PATH "$bin" run sshp -- sh -c 'eval "$GIT_SSH_COMMAND git@github.com"')
+[ "$out" = "FAKE-SSH -F $(pd sshp)/home/.ssh/config git@github.com" ] || fail "GIT_SSH_COMMAND uses the wrapper: $out"
+[ "$(perm "$(pd sshp)/bin")" = 700 ] || fail "wrapper folder is 0700"
+echo "ok   ssh: profile with .ssh/config gets -F (PATH and GIT_SSH_COMMAND)"
+out=$(PATH=$fakessh:$PATH "$bin" run nossh -- ssh git@github.com)
+[ "$out" = "FAKE-SSH git@github.com" ] || fail "ssh untouched without .ssh/config: $out"
+[ -z "$(PATH=$fakessh:$PATH "$bin" run nossh -- sh -c 'echo "$GIT_SSH_COMMAND"')" ] || fail "no GIT_SSH_COMMAND without .ssh/config"
+# Started from inside the ssh profile: the wrapper doesn't leak into another one.
+out=$(PATH=$fakessh:$PATH "$bin" run sshp -- "$bin" run nossh -- sh -c 'ssh h; echo "G=$GIT_SSH_COMMAND"')
+[ "$out" = "$(printf 'FAKE-SSH h\nG=')" ] || fail "no wrapper leak from a profile shell into another profile: $out"
+rm "$(pd sshp)/home/.ssh/config"
+out=$(PATH=$fakessh:$PATH "$bin" run sshp -- ssh git@github.com)
+[ "$out" = "FAKE-SSH git@github.com" ] && [ ! -e "$(pd sshp)/bin/ssh" ] || fail "wrapper removed with the config: $out"
+echo "ok   ssh: untouched without .ssh/config (and no leak between profiles)"
+
 # --- Scrollback, copy mode, mouse, clipboard (default keys, mouse on).
 "$bin" kill-server >/dev/null
 printf '[general]\ndefault_profile = "personal"\nscrollback = 2000\n' >"$OUI_HOME/config.toml"

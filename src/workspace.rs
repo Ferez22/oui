@@ -429,12 +429,13 @@ pub fn template(name: &str) -> String {
 pub fn new(name: &str) -> Result<()> {
     check_name(name)?;
     let dir = dir()?;
-    fs::create_dir_all(&dir)?;
+    profile::ensure_root()?;
+    profile::private_dir(&dir)?;
     let path = dir.join(format!("{name}.toml"));
     if path.exists() {
         bail!("{} already exists", path.display());
     }
-    fs::write(&path, template(name))?;
+    profile::write_private(&path, template(name).as_bytes())?;
     println!("created {} — edit it, then: oui open {name}", path.display());
     Ok(())
 }
@@ -457,12 +458,13 @@ pub async fn save(session: &str, name: Option<&str>, force: bool) -> Result<()> 
     let mut spec = describe(session).await?;
     spec.name = name.into();
     let dir = dir()?;
-    fs::create_dir_all(&dir)?;
+    profile::ensure_root()?;
+    profile::private_dir(&dir)?;
     let path = dir.join(format!("{name}.toml"));
     if path.exists() && !force {
         bail!("{} already exists (use --force to overwrite)", path.display());
     }
-    fs::write(&path, render(&spec))?;
+    profile::write_private(&path, render(&spec).as_bytes())?;
     println!("saved session '{session}' to {}", path.display());
     Ok(())
 }
