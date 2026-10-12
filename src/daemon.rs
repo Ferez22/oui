@@ -363,6 +363,11 @@ impl State {
 
         let id = self.next_pane;
         self.next_pane += 1;
+        if let Some(w) = &env.warning {
+            // Shown at the top of the pane, ahead of the shell's own output.
+            eprintln!("pane {id}: {w}");
+            let _ = self.events.send(Event::Output(id, format!("\x1b[33moUI ▸ {w}\x1b[0m\r\n").into_bytes()));
+        }
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
         let events = self.events.clone();

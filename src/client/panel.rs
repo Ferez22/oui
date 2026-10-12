@@ -347,8 +347,8 @@ mod tests {
             SessionInfo { name: "side".into(), tabs: 2, clients: 0 },
         ];
         p.profiles = vec![
-            ProfileConfig { name: "work".into(), color: "green".into(), shared: true, extra_shared: vec![] },
-            ProfileConfig { name: "personal".into(), color: "blue".into(), shared: false, extra_shared: vec![] },
+            ProfileConfig { name: "work".into(), color: "green".into(), shared: true, extra_shared: vec![], keychain: Default::default() },
+            ProfileConfig { name: "personal".into(), color: "blue".into(), shared: false, extra_shared: vec![], keychain: Default::default() },
         ];
         let here = Here { profile: "work", profile_color: Color::Green, session: "main", tabs: 3 };
         let widgets = [Widget::Accounts, Widget::Sessions, Widget::Profiles];

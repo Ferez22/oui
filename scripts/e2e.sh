@@ -8,6 +8,8 @@
 # of a second short temp dir for the socket, default /tmp; unix socket paths
 # must stay under ~100 chars), E2E_SHELL (pane shell, default /bin/sh).
 # Nothing is deleted; the temp dirs are printed at the end.
+# On macOS, HOME also points into the temp dir, with its own login keychain:
+# profile keychain passwords ("secure" mode) go there, never into yours.
 set -euo pipefail
 
 name=${1:-e2e}
@@ -22,6 +24,17 @@ tm=oui-$name-$$
 if [ ${#OUI_SOCKET} -ge 100 ]; then
     echo "socket path too long (${#OUI_SOCKET}); set E2E_SOCK_TMP to a shorter dir" >&2
     exit 1
+fi
+
+real_home=$HOME
+if [ "$(uname)" = Darwin ]; then
+    export HOME=$dir/realhome
+    fake_login=$HOME/Library/Keychains/login.keychain-db
+    mkdir -p "$HOME/Library/Keychains"
+    # Dummy password for this throwaway keychain; HOME is already the fake one,
+    # so it only joins the fake HOME's keychain search list.
+    security create-keychain -p e2e-dummy-password "$fake_login"
+    security set-keychain-settings "$fake_login" # no auto-lock during the run
 fi
 
 t() { tmux -L "$tm" "$@"; }
@@ -46,7 +59,7 @@ wait_for() {
     exit 1
 }
 
-(cd "$root" && cargo build -q)
+(cd "$root" && HOME=$real_home cargo build -q)
 "$bin" profile new work --color green >/dev/null
 "$bin" profile new personal --fresh >/dev/null
 # Quiet, predictable prompt in the fresh profile.
@@ -283,5 +296,123 @@ t send-keys 'clear; tput cols' Enter
 wait_for '^120$' "panel hidden again: pane back to 120 columns"
 t send-keys C-b d
 wait_for 'detached from session' "detach"
+
+# ---- macOS: per-profile keychains ----
+# Every profile HOME gets Library/Keychains/oui.keychain-db plus a
+# login.keychain-db symlink to it, which macOS then uses as that profile's
+# default keychain. Passwords live in the fake login keychain (secure) or a
+# 0600 file (file). Dummy values only.
+if [ "$(uname)" = Darwin ]; then
+    to() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+    pdir() { echo "$OUI_HOME/profiles/$1"; }
+    pkc() { echo "$OUI_HOME/profiles/$1/home/Library/Keychains/oui.keychain-db"; }
+    # Unlocked, with oUI's settings? (On a locked keychain show-keychain-info
+    # would prompt, hence the timeout; it only happens if oUI failed.)
+    unlocked() { to 10 security show-keychain-info "$(pkc "$1")" 2>&1 | grep -q 'no-timeout'; }
+    login_item() { security find-generic-password -s "oUI profile keychain" -a "$1 ($(pdir "$1"))" "$fake_login" >/dev/null 2>&1; }
+    ok() { echo "ok   $1"; }
+
+    "$bin" profile new kcsec --keychain secure --fresh >/dev/null
+    "$bin" profile new kcfile --keychain file --fresh >/dev/null
+    grep -q '^keychain = "secure"' "$(pdir kcsec)/profile.toml" || fail "secure mode saved in profile.toml"
+    grep -q '^keychain = "file"' "$(pdir kcfile)/profile.toml" || fail "file mode saved in profile.toml"
+    ok "keychain mode saved in profile.toml"
+    [ -f "$(pkc kcsec)" ] && [ -f "$(pkc kcfile)" ] || fail "profile new creates the profile keychains"
+    [ "$(readlink "$(pdir kcsec)/home/Library/Keychains/login.keychain-db")" = oui.keychain-db ] \
+        || fail "login.keychain-db links to the profile keychain"
+    unlocked kcsec && unlocked kcfile || fail "new keychains are unlocked, no auto-lock"
+    ok "profile new creates the profile keychains (unlocked, login.keychain-db link)"
+    login_item kcsec || fail "secure: password item in the (fake) login keychain"
+    [ ! -e "$(pdir kcsec)/keychain.pw" ] || fail "secure: no password file"
+    ok "secure: password in the login keychain, no file"
+    [ "$(stat -f %Lp "$(pdir kcfile)/keychain.pw")" = 600 ] || fail "file: keychain.pw is 0600"
+    ! login_item kcfile || fail "file: no login keychain item"
+    ok "file: password in a 0600 file, no login keychain item"
+    ! grep -q 'e2e-dummy\|[0-9a-f]\{64\}' "$(pdir kcsec)/profile.toml" || fail "no password in profile.toml"
+
+    "$bin" run kcsec -- security add-generic-password -s oui-dummy -a x -w dummy-secret
+    ok "security add-generic-password works inside a profile"
+    "$bin" run kcsec -- security find-generic-password -s oui-dummy >/dev/null 2>&1 || fail "item visible in its profile"
+    security find-generic-password -s oui-dummy "$(pkc kcsec)" >/dev/null 2>&1 || fail "item stored in the profile keychain"
+    ok "item lands in the profile's own keychain"
+    ! "$bin" run kcfile -- security find-generic-password -s oui-dummy >/dev/null 2>&1 || fail "item hidden from another profile"
+    ! security find-generic-password -s oui-dummy >/dev/null 2>&1 || fail "item hidden from the real HOME's default keychain"
+    ! security find-generic-password -s oui-dummy "$fake_login" >/dev/null 2>&1 || fail "item not in the real login keychain"
+    ok "item invisible from another profile and the real HOME"
+    if security list-keychains -d user | grep -q "$OUI_HOME/profiles"; then fail "profile keychains stay out of the real search list"; fi
+    ok "profile keychains stay out of the real search list"
+
+    # Locked (e.g. after a reboot): the next spawn unlocks it.
+    security lock-keychain "$(pkc kcsec)"
+    "$bin" run kcsec -- true
+    unlocked kcsec || fail "secure: unlocked at spawn"
+    security lock-keychain "$(pkc kcfile)"
+    "$bin" run kcfile -- true
+    unlocked kcfile || fail "file: unlocked at spawn"
+    "$bin" run kcfile -- security add-generic-password -s oui-dummy2 -a x -w dummy-secret || fail "file: usable after unlock"
+    ok "a locked profile keychain is unlocked at spawn (secure and file)"
+
+    # Profiles from before this feature: no keychain field, no keychain yet.
+    mkdir -p "$(pdir legacy)/home"
+    printf 'name = "legacy"\ncolor = "blue"\nshared = false\n' >"$(pdir legacy)/profile.toml"
+    printf "PS1='\$ '\n" >"$(pdir legacy)/home/.profile"
+    t new -d -s kc -x 120 -y 30 "'$bin' new -s kc -p legacy; sleep 60"
+    wait_for 'oUI +1 legacy' "session in a profile without a keychain"
+    t send-keys 'security add-generic-password -s oui-dummy -a x -w dummy-secret && echo KC-$((6*7))' Enter
+    wait_for '^KC-42' "first pane spawn creates the keychain; tools can store items"
+    [ -f "$(pkc legacy)" ] && unlocked legacy && login_item legacy || fail "legacy profile: keychain + secure password created lazily"
+    ok "legacy profile: keychain created lazily in secure mode"
+    t send-keys C-b d
+    wait_for 'detached from session' "detach"
+
+    # Errors never block the shell: a warning, then the command runs.
+    security lock-keychain "$(pkc kcfile)"
+    mv "$(pdir kcfile)/keychain.pw" "$dir/kcfile.pw"
+    out=$("$bin" run kcfile -- echo STILL-RUNS 2>&1)
+    echo "$out" | grep -q 'STILL-RUNS' || fail "shell starts despite a keychain error"
+    echo "$out" | grep -q 'warning: .*keychain' || fail "keychain error is shown as a warning"
+    if echo "$out" | grep -qE '[0-9a-f]{64}'; then fail "warning never shows a password"; fi
+    ok "keychain errors warn but don't block the process"
+    t new -d -s kcw -x 120 -y 30 "'$bin' new -s kcw -p kcfile; sleep 60"
+    wait_for "oUI ▸ profile 'kcfile' keychain not ready" "pane shows the keychain warning"
+    t send-keys 'echo PANE-$((6*7))' Enter
+    wait_for '^PANE-42' "and its shell still starts"
+    t send-keys C-b d
+    wait_for 'detached from session' "detach"
+    mv "$dir/kcfile.pw" "$(pdir kcfile)/keychain.pw"
+
+    # Claude Code login detected from the profile keychain (attributes only).
+    "$bin" run kcsec -- security add-generic-password -s "Claude Code-credentials" -a x -w dummy-secret
+    "$bin" accounts kcsec | grep -E '^claude +(yes|no) +logged in' >/dev/null || fail "accounts: claude logged in via the profile keychain"
+    "$bin" accounts kcfile | grep -E '^claude +(yes|no) +logged out' >/dev/null || fail "accounts: other profile still logged out"
+    ok "accounts: Claude Code item in the profile keychain means logged in"
+
+    # Switching modes keeps the keychain contents.
+    "$bin" profile keychain kcsec file >/dev/null
+    grep -q '^keychain = "file"' "$(pdir kcsec)/profile.toml" && [ -f "$(pdir kcsec)/keychain.pw" ] && ! login_item kcsec \
+        || fail "switch to file moves the password"
+    security lock-keychain "$(pkc kcsec)"
+    "$bin" run kcsec -- true
+    unlocked kcsec || fail "unlocked from the file after switch"
+    "$bin" run kcsec -- security find-generic-password -s oui-dummy >/dev/null 2>&1 || fail "contents kept after switch to file"
+    ok "switch secure -> file keeps the keychain"
+    "$bin" profile keychain kcsec secure >/dev/null
+    grep -q '^keychain = "secure"' "$(pdir kcsec)/profile.toml" && [ ! -e "$(pdir kcsec)/keychain.pw" ] && login_item kcsec \
+        || fail "switch to secure moves the password"
+    security lock-keychain "$(pkc kcsec)"
+    "$bin" run kcsec -- true
+    unlocked kcsec || fail "unlocked from the login keychain after switch"
+    "$bin" run kcsec -- security find-generic-password -s oui-dummy >/dev/null 2>&1 || fail "contents kept after switch to secure"
+    ok "switch file -> secure keeps the keychain"
+
+    # rm: confirmation required; removes the folder and the login keychain item.
+    if echo nope | "$bin" profile rm kcsec >/dev/null 2>&1; then fail "rm without confirmation"; fi
+    [ -d "$(pdir kcsec)" ] && login_item kcsec || fail "unconfirmed rm deletes nothing"
+    ok "rm asks for confirmation (wrong answer deletes nothing)"
+    echo kcsec | "$bin" profile rm kcsec >/dev/null 2>&1 || fail "confirmed rm"
+    [ ! -e "$(pdir kcsec)" ] && ! login_item kcsec || fail "rm removes the profile and its login keychain item"
+    ok "rm removes the profile and its password item"
+    if security list-keychains -d user | grep -q "$OUI_HOME/profiles"; then fail "real search list still clean"; fi
+fi
 
 echo "all e2e checks passed (temp dirs: $dir $sockdir)"

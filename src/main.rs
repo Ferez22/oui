@@ -4,14 +4,16 @@ mod accounts;
 mod client;
 mod config;
 mod daemon;
+mod keychain;
 mod layout;
 mod profile;
 mod protocol;
 mod workspace;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use protocol::ClientMsg;
+use std::io::{BufRead, IsTerminal, Write};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
@@ -108,7 +110,21 @@ enum ProfileCmd {
         fresh: bool,
         #[arg(long, default_value = "blue")]
         color: String,
+        /// macOS: where the profile keychain's password is kept: `secure` (your
+        /// login keychain; macOS may ask once to allow oUI) or `file` (a 0600
+        /// file in the profile, no prompts). Asked interactively if omitted.
+        #[arg(long, value_enum)]
+        keychain: Option<keychain::Mode>,
     },
+    /// Switch where a profile keychain's password is kept (its logins are kept)
+    Keychain {
+        name: String,
+        #[arg(value_enum)]
+        mode: keychain::Mode,
+    },
+    /// Delete a profile and all its logins (asks for confirmation)
+    #[command(alias = "remove")]
+    Rm { name: String },
     /// List profiles
     #[command(alias = "ls")]
     List,
@@ -120,8 +136,15 @@ enum ProfileCmd {
     },
 }
 
+/// How long `oui shell` / `oui run` wait for the profile keychain (a macOS
+/// access prompt may be showing; the user is right there to answer it).
+const EXEC_KEYCHAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn exec_in(name: &str, program: &str, args: &[String]) -> Result<()> {
-    let env = profile::spawn_env(Some(name))?;
+    let env = profile::spawn_env_with(Some(name), Some(EXEC_KEYCHAIN_WAIT))?;
+    if let Some(w) = &env.warning {
+        eprintln!("oUI ▸ warning: {w}");
+    }
     let mut c = Command::new(program);
     c.args(args);
     for var in &env.remove {
@@ -161,15 +184,53 @@ fn main() -> Result<()> {
             println!("{}: ok", config::path()?.display());
             Ok(())
         }
-        Some(Cmd::Profile(ProfileCmd::New { name, fresh, color })) => {
-            let dir = profile::create(&name, &color, fresh)?;
+        Some(Cmd::Profile(ProfileCmd::New { name, fresh, color, keychain })) => {
+            profile::profile_dir(&name)?; // validate the name before asking anything
+            let mode = match keychain {
+                Some(m) => m,
+                None => ask_keychain_mode(&name)?,
+            };
+            let (dir, warning) = profile::create(&name, &color, fresh, mode)?;
             println!("created profile '{name}' at {} (shared dotfiles: {})", dir.display(), !fresh);
+            if cfg!(target_os = "macos") {
+                println!("keychain: {}", mode.label());
+            }
+            if let Some(w) = warning {
+                eprintln!("warning: {w}");
+            }
             Ok(())
         }
         Some(Cmd::Profile(ProfileCmd::List)) => {
             for p in profile::list() {
-                println!("{:<16} color={:<8} shared={}", p.name, p.color, p.shared);
+                println!("{:<16} color={:<8} shared={:<5} keychain={}", p.name, p.color, p.shared, p.keychain.label());
             }
+            Ok(())
+        }
+        Some(Cmd::Profile(ProfileCmd::Keychain { name, mode })) => {
+            profile::set_keychain_mode(&name, mode)?;
+            let place = match mode {
+                keychain::Mode::Secure => "your login keychain (secure)".to_string(),
+                keychain::Mode::File => format!("{} in the profile folder (file)", keychain::PASSWORD_FILE),
+            };
+            println!("profile '{name}': keychain password now kept in {place}");
+            Ok(())
+        }
+        Some(Cmd::Profile(ProfileCmd::Rm { name })) => {
+            let (dir, _) = profile::load(&name)?;
+            eprint!(
+                "Delete profile '{name}' ({}) with all its logins and keychain?\nType the profile name to confirm: ",
+                dir.display()
+            );
+            std::io::stderr().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().lock().read_line(&mut answer)?;
+            if answer.trim() != name {
+                bail!("not confirmed; nothing deleted");
+            }
+            if let Some(w) = profile::remove(&name)? {
+                eprintln!("warning: {w}");
+            }
+            println!("deleted profile '{name}'");
             Ok(())
         }
         Some(Cmd::Profile(ProfileCmd::Share { name, on })) => {
@@ -186,10 +247,35 @@ fn main() -> Result<()> {
         Some(Cmd::Run { name, cmd }) => exec_in(&name, &cmd[0], &cmd[1..]),
         Some(Cmd::Accounts { profile }) => accounts::print_table(profile.as_deref()),
         Some(Cmd::Env { name }) => {
-            for (k, v) in profile::spawn_env(Some(&name))?.set {
+            for (k, v) in profile::spawn_env_with(Some(&name), None)?.set {
                 println!("{k}={v}");
             }
             Ok(())
+        }
+    }
+}
+
+/// `oui profile new` without `--keychain`: ask on a terminal (macOS), else `secure`.
+fn ask_keychain_mode(name: &str) -> Result<keychain::Mode> {
+    if !cfg!(target_os = "macos") || !std::io::stdin().is_terminal() {
+        return Ok(keychain::Mode::default());
+    }
+    eprintln!("Profile '{name}' gets its own macOS keychain. Where should oUI keep its password?");
+    eprintln!("  1) secure (default): in your login keychain. macOS may ask once to let oui");
+    eprintln!("     use it; choose \"Always Allow\".");
+    eprintln!("  2) file: in a private file in the profile folder. No prompts; protected like");
+    eprintln!("     the token files other CLIs keep in your home.");
+    loop {
+        eprint!("Choose [1]: ");
+        std::io::stderr().flush()?;
+        let mut answer = String::new();
+        if std::io::stdin().lock().read_line(&mut answer)? == 0 {
+            return Ok(keychain::Mode::default());
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" | "1" | "secure" => return Ok(keychain::Mode::Secure),
+            "2" | "file" => return Ok(keychain::Mode::File),
+            _ => eprintln!("please answer 1 or 2"),
         }
     }
 }

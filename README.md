@@ -92,5 +92,21 @@ extra_shared = [".config/foo", ".mytool/config"]
 
 Each profile gets its own `HOME` and XDG directories (plus small per-tool adapters), so any CLI's normal login command logs in **for that profile only**.
 
+```bash
+oui profile list                        # name, colour, shared, keychain mode
+oui profile keychain work file          # switch keychain mode (logins are kept)
+oui profile rm work                     # delete a profile and its logins (asks first)
+```
+
+### macOS: a keychain per profile
+Tools that keep logins in the macOS keychain (Claude Code, `gh`, git's `osxkeychain` helper, …) use the *default* keychain, which macOS finds through `HOME`. So every profile gets its own keychain in `~/.oui/profiles/<name>/home/Library/Keychains/`, created by `oui profile new` (or at the first shell for older profiles) and unlocked whenever oUI starts a shell in that profile. Logins saved there are invisible to your other profiles and to your normal environment.
+
+The profile keychain is protected by a random password. Where oUI keeps it is chosen per profile (`oui profile new` asks; or pass `--keychain secure|file`):
+
+- **secure** (default): in your login keychain, as an item named "oUI profile keychain". The profile's keychain stays encrypted at rest. The first time oUI reads that item (after a reboot, or after you upgrade `oui`), macOS may show a dialog asking whether `oui` may use it: that is macOS checking which app wants the password. Choose **Always Allow**; the profile's shells start anyway and the keychain unlocks once you answer.
+- **file**: in `~/.oui/profiles/<name>/keychain.pw` (readable only by you). No dialogs ever; the protection is the same as the token files most CLIs keep in your home folder.
+
+If a profile keychain can't be unlocked, the shell still starts and shows a yellow `oUI ▸` warning. On Linux this doesn't apply: CLIs there keep logins in files (isolated by `HOME`/XDG) or in the Secret Service, which oUI doesn't isolate yet.
+
 ## License
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.

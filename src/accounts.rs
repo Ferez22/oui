@@ -1,11 +1,12 @@
 //! Connected accounts: which CLI tools are logged in for a profile (or system).
 //!
-//! Detection is offline and filesystem-only: it never runs tool commands (they
-//! may hit the network or block on a prompt) and never touches the macOS
-//! Keychain or Linux keyrings. Secrets are never returned: config files are
-//! parsed into structs that keep only non-secret identity fields (email,
-//! username, account name); token fields are checked for presence only.
-//! A login kept only in a keyring shows as `Unknown`.
+//! Detection is offline: it never runs tool commands (they may hit the
+//! network or block on a prompt) and never reads keyring secrets. Secrets are
+//! never returned: config files are parsed into structs that keep only
+//! non-secret identity fields (email, username, account name); token fields are
+//! checked for presence only. A login kept only in a keyring shows as
+//! `Unknown`, except Claude Code in a profile's own macOS keychain, which is
+//! looked up by item attributes only (see `keychain::has_service_prefix`).
 //!
 //! To support a new tool, add a checker below and a row to `TOOLS`.
 
@@ -228,7 +229,9 @@ fn logged_out() -> Check {
 
 /// Claude Code: `oauthAccount.emailAddress` in `.claude.json` (non-secret) or
 /// a `.credentials.json` file (Linux; never opened). On macOS the token is in
-/// the Keychain, so a config without a marker is `Unknown`.
+/// the Keychain: in a profile, an item whose service starts with "Claude Code"
+/// in the profile keychain means logged in (attributes only; a locked keychain
+/// is never unlocked). Otherwise a config without a marker is `Unknown`.
 fn claude(env: &Env) -> Check {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -251,6 +254,10 @@ fn claude(env: &Env) -> Check {
         return (LoginState::LoggedIn, a.email_address.clone());
     }
     if has_creds || matches!(&cfg, Some(Cfg { primary_api_key: Some(_), .. })) {
+        return (LoginState::LoggedIn, None);
+    }
+    let in_profile = env.var("OUI_PROFILE").is_some_and(|p| p != profile::SYSTEM);
+    if env.macos && in_profile && crate::keychain::has_service_prefix(&env.home(), "Claude Code") {
         return (LoginState::LoggedIn, None);
     }
     if cfg.is_some() && env.macos {
