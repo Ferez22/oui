@@ -20,7 +20,8 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-14
+            cross: true # built on Apple Silicon; tests run on the native targets
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
@@ -31,6 +32,7 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
       - name: Test
+        if: ${{ !matrix.cross }}
         run: cargo test --locked --release --target ${{ matrix.target }}
       - name: Build
         run: cargo build --locked --release --target ${{ matrix.target }}
