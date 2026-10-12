@@ -35,6 +35,7 @@ use std::time::Duration;
 /// Service name of the password items in the real login keychain.
 pub const SERVICE: &str = "oUI profile keychain";
 /// Name of the profile keychain file in `<profile home>/Library/Keychains`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const KEYCHAIN_FILE: &str = "oui.keychain-db";
 /// File holding the password in `file` mode, inside the profile directory.
 pub const PASSWORD_FILE: &str = "keychain.pw";
@@ -60,6 +61,7 @@ impl Mode {
 }
 
 /// The profile keychain file inside a profile's HOME.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn keychain_path(home: &Path) -> PathBuf {
     home.join("Library/Keychains").join(KEYCHAIN_FILE)
 }
@@ -73,6 +75,7 @@ pub fn login_keychain_path(home: &Path) -> PathBuf {
 
 /// A profile's identity for its password: its name and directory (`<root>/profiles/<name>`).
 pub struct Profile<'a> {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub name: &'a str,
     pub dir: &'a Path,
 }
