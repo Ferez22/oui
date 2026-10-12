@@ -47,6 +47,11 @@ wait_for() {
 }
 
 (cd "$root" && cargo build -q)
+# A fake HOME for oUI and the host tmux: never read the user's ~/.tmux.conf
+# (the first-launch import offer) or dotfiles. Set after building (cargo/rustup).
+export HOME=$dir/fakehome
+mkdir -p "$HOME"
+unset XDG_CONFIG_HOME OUI_REAL_HOME
 "$bin" profile new work --color green >/dev/null
 "$bin" profile new personal --fresh >/dev/null
 # Quiet, predictable prompt in the fresh profile.
@@ -55,6 +60,10 @@ printf "PS1='$ '\n" | tee "$OUI_HOME/profiles/personal/home/.profile" >"$OUI_HOM
 t new -d -s t -x 120 -y 30 "'$bin' new -s demo -p personal; sleep 60"
 wait_for 'oUI +1 personal' "session starts in profile 'personal'"
 wait_for '^\$' "shell prompt"
+wait_for '^ oUI  1 personal   \+ .* session demo *$' "tab bar: badge, tab, + button, session name"
+bar=$(t capture-pane -p -e | head -1)
+case $bar in *'48;5;4m 1 personal'*'48;5;235m'*'48;5;238m + '*) echo "ok   tab bar colours (bar, active tab in profile colour, + button)";;
+    *) echo "FAIL tab bar colours" >&2; printf '%s\n' "$bar" | od -c | head -20 >&2; exit 1;; esac
 
 t send-keys 'echo LEFT-$((6*7))' Enter
 wait_for '^LEFT-42' "command runs in first pane"
@@ -73,6 +82,44 @@ t send-keys C-b Left
 t send-keys 'echo BACK-$((6*7))' Enter
 wait_for '^BACK-42' "focus moves left"
 
+# Modifier still held after the prefix (Ctrl-b, then Ctrl+arrow): focus, no leak.
+raw() { t send-keys -H $(printf '%b' "$1" | od -An -tx1); }
+no_leak() { if screen | grep -qE -- "$1"; then echo "FAIL $2" >&2; screen >&2; exit 1; fi; echo "ok   $2"; }
+t send-keys 'clear' Enter
+raw '\x02\e[1;5C'
+t send-keys 'echo CRIGHT-$((6*7))' Enter
+wait_for '│CRIGHT-42' "prefix + Ctrl-Right (ESC[1;5C) focuses right"
+raw '\x02\e[1;3D'
+t send-keys 'echo ALEFT-$((6*7))' Enter
+wait_for '^ALEFT-42' "prefix + Alt-Left (ESC[1;3D) focuses left"
+t send-keys C-b C-Right
+t send-keys 'echo TMUXCR-$((6*7))' Enter
+wait_for '│TMUXCR-42' "prefix + C-Right (tmux key name) focuses right"
+t send-keys C-b C-Up
+sleep 0.2
+no_leak '1;5|\[1;|;5[ABCD]' "no modifier-arrow bytes leak into the panes"
+raw '\x02\e[1;5P'
+wait_for 'unknown key: \^b \^\[\[1;5P \(ignored\)' "unknown key after the prefix flashes"
+t send-keys 'echo AFTERUNK' Enter
+wait_for 'AFTERUNK$' "typing after an unknown key"
+no_leak '5P|\^\[' "unknown escape sequence swallowed whole"
+col() { screen | sed -n 3p | awk '{print index($0, "│")}'; }
+c1=$(col)
+t send-keys C-b S-Left
+for _ in $(seq 50); do [ "$(col)" != "$c1" ] && break; sleep 0.1; done
+[ "$(col)" -lt "$c1" ] || { echo "FAIL prefix + Shift-Left resizes" >&2; screen >&2; exit 1; }
+echo "ok   prefix + Shift-Left resizes (divider $c1 -> $(col))"
+# Repeat: after prefix + arrow, arrows keep moving focus for a moment.
+t send-keys C-b Left Right
+t send-keys 'echo REP1-$((6*7))' Enter
+wait_for '│REP1-42' "repeat: a second arrow without the prefix moves focus"
+t send-keys C-b Left
+wait_for ' REPEAT ' "repeat window shows in the status bar"
+sleep 1
+t send-keys Right 'echo REP2-$((6*7))' Enter
+wait_for '^REP2-42' "after the window, arrows go to the shell again"
+no_leak ' REPEAT ' "repeat badge goes away"
+
 t send-keys C-b z
 wait_for ' ZOOM ' "zoom shows in status bar"
 t send-keys C-b z
@@ -84,7 +131,18 @@ if screen | grep -q '├'; then echo "FAIL closing a pane collapses the layout" 
 echo "ok   closing a pane collapses the layout"
 
 t send-keys C-b d
-wait_for 'detached from session' "detach"
+wait_for 'Detach from oUI\? Your shells keep running' "detach asks for confirmation"
+t send-keys n
+sleep 0.2
+no_leak 'Detach from oUI' "n keeps the client"
+t send-keys C-b d Escape
+sleep 0.2
+no_leak 'Detach from oUI' "Esc keeps the client"
+t send-keys C-b d Enter
+sleep 0.2
+no_leak 'Detach from oUI|detached from' "Enter (default) keeps the client"
+t send-keys C-b d y
+wait_for "detached from session 'demo'. Your shells keep running; reattach with: oui attach demo" "y detaches, with a reattach hint"
 if ! "$bin" ls | grep -q '^demo: 1 tab'; then echo "FAIL session survives detach" >&2; exit 1; fi
 echo "ok   session survives detach"
 
@@ -126,7 +184,7 @@ t send-keys C-b 2
 wait_for '^TAB-TWO' "second tab runs its command in its own profile"
 t send-keys 'echo MARK-$((6*7)) $OUI_PROFILE' Enter
 wait_for '^MARK-42 personal' "second tab runs in profile 'personal'"
-t send-keys C-b d
+t send-keys C-b d y # detach asks first
 wait_for 'detached from session' "detach from workspace"
 
 t new-window "'$bin' open proj; sleep 60"
@@ -144,7 +202,7 @@ grep -q "proj\"" "$saved" || fail "saved cwd: $(cat "$saved")"
 if "$bin" workspace save proj saved 2>/dev/null; then fail "save refuses to overwrite"; fi
 echo "ok   workspace save writes profiles, splits and cwd"
 
-t send-keys C-b d
+t send-keys C-b d y # detach asks first
 wait_for 'detached from session' "detach again"
 "$bin" kill proj >/dev/null
 t new-window "'$bin' open saved; sleep 60"
@@ -152,7 +210,7 @@ wait_for '1 work +2 personal' "saved workspace reopens with both tabs"
 wait_for '├─' "saved workspace restores the split tree"
 "$bin" ls | grep -q '^saved: 2 tab' || fail "saved session has 2 tabs"
 echo "ok   workspace save round-trips"
-t send-keys C-b d
+t send-keys C-b d y # detach asks first
 wait_for 'detached from session' "detach from saved workspace"
 
 # --- Custom config: prefix, a remapped key, theme, status segments, general.
@@ -193,7 +251,7 @@ t send-keys C-a v
 wait_for '│\$' "remapped split key (prefix C-a v)"
 t send-keys C-a b
 wait_for 'ACCOUNTS · cfgp' "remapped prefix opens the panel (C-a b)"
-t send-keys C-a d
+t send-keys C-a d y # detach asks first
 wait_for 'detached from session' "detach with C-a d"
 
 sed -i.bak 's/^default_profile = .*/default_profile = "ghost"/' "$OUI_HOME/config.toml"
@@ -201,7 +259,7 @@ t kill-session -t c
 t new -d -s g -x 160 -y 30 "'$bin' new -s ghost; sleep 60"
 wait_for 'oUI +1 system' "missing default_profile falls back to system"
 wait_for "default_profile: profile 'ghost' not found" "and warns in the status bar"
-t send-keys C-a d
+t send-keys C-a d y # detach asks first
 wait_for 'detached from session' "detach"
 
 # --- Right panel (connected accounts), session picker, rename tab.
@@ -264,7 +322,7 @@ t send-keys C-b s
 wait_for '▸ panel +3 tabs' "prefix s opens the session picker"
 t send-keys n other Enter
 wait_for ' other │' "picker creates and switches to a new session"
-wait_for 'oUI +1 acct *$' "new session has one tab"
+wait_for 'oUI +1 acct +\+ ' "new session has one tab"
 t send-keys C-b s
 wait_for '  panel +3 tabs' "picker lists both sessions"
 t send-keys j Enter
@@ -281,7 +339,7 @@ t send-keys Escape
 t send-keys C-b b
 t send-keys 'clear; tput cols' Enter
 wait_for '^120$' "panel hidden again: pane back to 120 columns"
-t send-keys C-b d
+t send-keys C-b d y # detach asks first
 wait_for 'detached from session' "detach"
 
 # --- Scrollback, copy mode, mouse, clipboard (default keys, mouse on).
@@ -289,7 +347,6 @@ wait_for 'detached from session' "detach"
 printf '[general]\ndefault_profile = "personal"\nscrollback = 2000\n' >"$OUI_HOME/config.toml"
 clip=$dir/clipboard.txt
 # raw <bytes>: inject raw bytes (mouse reports) as if typed in the host terminal.
-raw() { t send-keys -H $(printf '%b' "$1" | od -An -tx1); }
 # clip_is <text> <what>: the clipboard test hook file holds exactly <text>.
 clip_is() {
     for _ in $(seq 50); do
@@ -347,8 +404,10 @@ raw '\e[<0;70;6M\e[<0;70;6m'
 wait_for '│\^\[\[<0;[0-9]+;5M' "mouse reports go to an app that asked for them (pane-relative)"
 t send-keys C-c
 
-t send-keys C-b c Enter
-wait_for 'oUI +1 personal +2 personal' "second tab"
+raw '\e[<0;20;1M\e[<0;20;1m' # the + button after " oUI " and " 1 personal "
+wait_for ' new tab · profile ' "clicking + opens the new-tab picker"
+t send-keys Enter
+wait_for 'oUI +1 personal +2 personal +\+ ' "second tab"
 raw '\e[<0;8;1M\e[<0;8;1m'
 wait_for '^CLICK-42' "click on a tab selects it"
 
@@ -381,7 +440,7 @@ for _ in $(seq 50); do screen | grep -q ' PANEL ' || break; sleep 0.1; done
 if screen | grep -q ' PANEL '; then echo "FAIL prefix Tab leaves panel focus" >&2; screen >&2; exit 1; fi
 echo "ok   prefix Tab leaves panel focus"
 t send-keys C-b b
-t send-keys C-b d
+t send-keys C-b d y # detach asks first
 wait_for 'detached from session' "detach"
 
 # Reattached clients get the history from the daemon; apps' OSC 52 is forwarded.
@@ -394,7 +453,119 @@ wait_for '^1 +│' "history from the daemon after reattach"
 t send-keys q
 t send-keys "printf '\\033]52;c;%s\\007' \$(printf APPCLIP | base64)" Enter
 clip_is "APPCLIP" "OSC 52 from an app in a pane reaches the clipboard"
-t send-keys C-b d
+t send-keys C-b d y # detach asks first
 wait_for 'detached from session' "detach"
+
+
+# --- Confirmations before ending oUI; closing busy panes.
+"$bin" kill-server >/dev/null
+sleep 0.3
+: >"$OUI_HOME/config.toml"
+t kill-session -t r
+t new -d -s b -x 120 -y 30 "'$bin' new -s bye -p personal; sleep 60"
+wait_for '^\$' "shell prompt"
+t send-keys C-b %
+wait_for '│\$' "split"
+t send-keys 'sleep 100' Enter
+sleep 0.3
+t send-keys C-b x
+wait_for "Close this pane\? 'sleep' is still running in it" "closing a pane with a running program asks"
+t send-keys n
+sleep 0.2
+no_leak 'Close this pane' "n keeps the pane"
+screen | grep -q '│\$ sleep 100' || fail "pane still there"
+t send-keys C-c
+sleep 0.2
+t send-keys C-b x
+panes() { screen | sed -n '2,29p'; } # without the bars
+for _ in $(seq 50); do panes | grep -q '│' || break; sleep 0.1; done
+if panes | grep -q '│'; then fail "closing an idle pane (not the last) closes it"; fi
+no_leak ' CONFIRM ' "closing an idle pane (not the last) needs no confirmation"
+t send-keys C-b '&'
+wait_for "Close oUI\? This ends session 'bye' and its shells" "closing the last tab asks"
+t send-keys n
+sleep 0.2
+no_leak 'Close oUI' "n keeps the session"
+t send-keys C-b x
+wait_for "Close oUI\? This ends session 'bye' and its shells" "closing the last pane asks"
+t send-keys y
+wait_for "session 'bye' ended. Bye!" "y ends the session with a goodbye"
+if "$bin" ls 2>/dev/null | grep -q '^bye:'; then fail "session bye is gone"; fi
+echo "ok   session bye is gone"
+
+t kill-session -t b
+sleep 0.3
+t new -d -s e -x 120 -y 30 "'$bin' new -s ex -p personal; sleep 60"
+wait_for '^\$' "shell prompt"
+t send-keys 'exit' Enter
+wait_for "session 'ex' ended. Bye!" "exit in the last shell ends without a prompt"
+
+t kill-session -t e
+sleep 0.3
+t new -d -s o -x 120 -y 30 "'$bin' new -s solo -p personal; sleep 60"
+wait_for '^\$' "shell prompt"
+t send-keys C-b s
+wait_for '▸ solo +1 tab' "session picker lists the only session"
+t send-keys x
+wait_for "Close oUI\? This ends session 'solo' and its shells. y/n" "killing the only session from the picker says it closes oUI"
+t send-keys n Escape
+"$bin" ls | grep -q '^solo:' || fail "n keeps it"
+echo "ok   n keeps it"
+t send-keys C-b d y
+wait_for 'detached from session' "detach"
+
+# --- First launch with a tmux config: offer to import it (fake HOME only).
+"$bin" kill-server >/dev/null
+sleep 0.3
+rm "$OUI_HOME/config.toml"
+cat >"$HOME/.tmux.conf" <<'TMUXCONF'
+set -g prefix C-a
+unbind C-b
+bind C-a send-prefix
+bind v split-window -h
+set -g mouse on
+set -g status-style bg=blue
+TMUXCONF
+start() { t kill-session -t i 2>/dev/null || true; t new -d -s i -x 120 -y 30 "'$bin' new -s imp -p personal; sleep 60"; }
+t kill-session -t o
+start
+wait_for 'Found your tmux config \(~/.tmux.conf\)' "tmux config found: import offered"
+wait_for '\+ line 4: bind v split-window -h  ->  v = "split-right"' "offer lists what it imports"
+wait_for '\[y\]es · \[n\]o · \[d\]on.t ask again' "offer keys"
+wait_for ' SETUP ' "offer shows in the mode badge"
+t send-keys n
+wait_for 'tmux config not imported' "n skips"
+if [ -e "$OUI_HOME/config.toml" ]; then fail "n writes nothing"; fi
+echo "ok   n writes nothing"
+t send-keys C-b d y
+wait_for 'detached from session' "detach"
+start
+wait_for 'Found your tmux config' "offered again after n"
+t send-keys d
+wait_for "won't ask again" "d: don't ask again"
+grep -q "don't ask again" "$OUI_HOME/config.toml" || fail "d writes a minimal config"
+"$bin" config check >/dev/null || fail "minimal config is valid"
+echo "ok   d writes a minimal valid config"
+t send-keys C-b d y
+wait_for 'detached from session' "detach"
+start
+wait_for '^\$' "shell prompt"
+no_leak 'Found your tmux config' "not offered again after d"
+t send-keys C-b d y
+wait_for 'detached from session' "detach"
+rm "$OUI_HOME/config.toml"
+start
+wait_for 'Found your tmux config' "offered again without a config"
+t send-keys y
+wait_for 'imported [0-9]+ setting\(s\) from ~/.tmux.conf \(prefix \^a\)' "y imports"
+grep -q '^prefix = "C-a"' "$OUI_HOME/config.toml" || fail "imported config written"
+echo "ok   imported config written"
+t send-keys Enter # any key clears the message
+wait_for '\^a c tab' "hints use the imported prefix right away"
+t send-keys C-a v
+wait_for '│\$' "imported binding works live (C-a v splits)"
+t send-keys C-a d y
+wait_for 'detached from session' "detach with the imported prefix"
+rm "$HOME/.tmux.conf"
 
 echo "all e2e checks passed (temp dirs: $dir $sockdir)"

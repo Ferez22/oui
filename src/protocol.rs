@@ -62,6 +62,10 @@ pub enum ClientMsg {
     /// Input for a specific pane of the client's session, focused or not
     /// (mouse events forwarded to an app under the pointer).
     PaneInput { pane: u32, #[serde(with = "serde_bytes")] data: Vec<u8> },
+    /// Which programs (other than the shell) run in the foreground of the
+    /// focused pane, or of every pane of the active tab with `tab`; answered
+    /// with `ServerMsg::Busy` to this client only (close confirmations).
+    Busy { tab: bool },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -115,6 +119,8 @@ pub enum ServerMsg {
     History { pane: u32, rows: u16, cols: u16, history: u32, #[serde(with = "serde_bytes")] data: Vec<u8> },
     /// An app in a pane set the clipboard (OSC 52); base64 payload as sent.
     Clipboard(#[serde(with = "serde_bytes")] Vec<u8>),
+    /// Reply to `ClientMsg::Busy`: names of the foreground programs found.
+    Busy(Vec<String>),
 }
 
 pub async fn write_msg<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> Result<()> {

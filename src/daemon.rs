@@ -367,6 +367,11 @@ impl State {
                 p.writer.write_all(&data)?;
                 p.writer.flush()?;
             }
+            ClientMsg::Busy { tab } => {
+                let (_, panes) = self.with_tab(id, |t, _| if tab { t.root.leaves() } else { vec![t.focused] })?;
+                let busy = panes.iter().filter_map(|p| self.panes.get(p)).filter_map(foreground_program).collect();
+                tx.send(ServerMsg::Busy(busy))?;
+            }
             ClientMsg::FocusPane(pane) => {
                 let (name, changed) = self.with_tab(id, |t, _| {
                     let ok = t.root.contains(pane) && t.focused != pane;
@@ -711,6 +716,29 @@ impl State {
 /// Tab names are one short line of printable text.
 fn clean_tab_name(name: &str) -> String {
     name.chars().filter(|c| !c.is_control()).take(32).collect::<String>().trim().to_string()
+}
+
+/// The program in the pane's foreground when it isn't the shell itself: the
+/// PTY's foreground process group differs from the shell's pid.
+fn foreground_program(p: &Pane) -> Option<String> {
+    let pgrp = p.master.process_group_leader().filter(|&g| g > 0)? as u32;
+    if Some(pgrp) == p.child.process_id() {
+        return None;
+    }
+    Some(pid_name(pgrp).unwrap_or_else(|| format!("process {pgrp}")))
+}
+
+#[cfg(target_os = "macos")]
+fn pid_name(pid: u32) -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: proc_name writes at most `buf.len()` bytes into `buf`.
+    let n = unsafe { libc::proc_name(pid as libc::c_int, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pid_name(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// Current directory of process `pid`, so a split starts where the focused shell is.

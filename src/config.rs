@@ -326,15 +326,10 @@ impl Keys {
         self.prefix.seqs.iter().filter(|s| bytes.starts_with(s)).map(Vec::len).max()
     }
 
-    /// The bound action at the start of `bytes` (input after the prefix) and how
-    /// many bytes it consumed. Longest match wins, so `Esc` doesn't eat `Up`.
-    pub fn lookup(&self, bytes: &[u8]) -> Option<(Action, usize)> {
-        self.bindings
-            .iter()
-            .flat_map(|b| b.key.seqs.iter().map(move |s| (b.action, s)))
-            .filter(|(_, s)| bytes.starts_with(s))
-            .max_by_key(|(_, s)| s.len())
-            .map(|(a, s)| (a, s.len()))
+    /// The action bound to exactly `key`: one whole key as the client splits
+    /// input (a full escape sequence, so a bound `Esc` never eats `Up`).
+    pub fn bound(&self, key: &[u8]) -> Option<Action> {
+        self.bindings.iter().find(|b| b.key.seqs.iter().any(|s| s == key)).map(|b| b.action)
     }
 
     /// The key bound to `action`, for hints (first in notation order).
@@ -573,8 +568,9 @@ macro_rules! theme_fields {
 }
 
 theme_fields! {
-    tab_bar_bg: "Tab bar background",
-    tab_bar_fg: "Tab bar text",
+    tab_bar_bg: "Tab bar background (the whole top row)",
+    tab_bar_fg: "Tab bar text (tab numbers, names, session)",
+    tab_inactive_bg: "Background of inactive tabs and the + button",
     tab_active_bg: "Active tab background",
     tab_active_fg: "Active tab text",
     status_bg: "Status bar background",
@@ -594,8 +590,9 @@ impl Theme {
         let rgb = |r, g, b| C(Color::Rgb(r, g, b));
         Some(match name {
             "default" => Theme {
-                tab_bar_bg: C(Color::Reset),
-                tab_bar_fg: C(Color::Reset),
+                tab_bar_bg: C(Color::Indexed(235)),
+                tab_bar_fg: C(Color::Indexed(252)),
+                tab_inactive_bg: C(Color::Indexed(238)),
                 tab_active_bg: Profile,
                 tab_active_fg: C(Color::Black),
                 status_bg: C(Color::Indexed(236)),
@@ -609,6 +606,7 @@ impl Theme {
             "nord" => Theme {
                 tab_bar_bg: rgb(0x2e, 0x34, 0x40),
                 tab_bar_fg: rgb(0xd8, 0xde, 0xe9),
+                tab_inactive_bg: rgb(0x43, 0x4c, 0x5e),
                 tab_active_bg: Profile,
                 tab_active_fg: rgb(0x2e, 0x34, 0x40),
                 status_bg: rgb(0x3b, 0x42, 0x52),
@@ -620,8 +618,9 @@ impl Theme {
                 accent: rgb(0x88, 0xc0, 0xd0),
             },
             "light" => Theme {
-                tab_bar_bg: rgb(0xee, 0xee, 0xee),
-                tab_bar_fg: rgb(0x44, 0x44, 0x44),
+                tab_bar_bg: rgb(0xd8, 0xd8, 0xd8),
+                tab_bar_fg: rgb(0x33, 0x33, 0x33),
+                tab_inactive_bg: rgb(0xf5, 0xf5, 0xf5),
                 tab_active_bg: Profile,
                 tab_active_fg: rgb(0xff, 0xff, 0xff),
                 status_bg: rgb(0xdd, 0xdd, 0xdd),
@@ -949,28 +948,28 @@ mod tests {
         let keys = Keys::default();
         assert_eq!(keys.match_prefix(b"\x02x"), Some(1));
         assert_eq!(keys.match_prefix(b"x"), None);
-        assert_eq!(keys.lookup(b"c"), Some((Action::NewTab, 1)));
-        assert_eq!(keys.lookup(b"5rest"), Some((Action::SelectTab(5), 1)));
-        assert_eq!(keys.lookup(b"\x1b[Aabc"), Some((Action::FocusUp, 3)));
-        assert_eq!(keys.lookup(b"\x1bOB"), Some((Action::FocusDown, 3)));
-        assert_eq!(keys.lookup(b"\""), Some((Action::SplitDown, 1)));
-        assert_eq!(keys.lookup(b"\x02"), Some((Action::SendPrefix, 1)));
-        assert_eq!(keys.lookup(b"\x1b"), None);
-        assert_eq!(keys.lookup(b"y"), None);
+        assert_eq!(keys.bound(b"c"), Some(Action::NewTab));
+        assert_eq!(keys.bound(b"5"), Some(Action::SelectTab(5)));
+        assert_eq!(keys.bound(b"\x1b[A"), Some(Action::FocusUp));
+        assert_eq!(keys.bound(b"\x1bOB"), Some(Action::FocusDown));
+        assert_eq!(keys.bound(b"\""), Some(Action::SplitDown));
+        assert_eq!(keys.bound(b"\x02"), Some(Action::SendPrefix));
+        assert_eq!(keys.bound(b"\x1b"), None);
+        assert_eq!(keys.bound(b"y"), None);
         assert_eq!(keys.key_for(Action::Detach), Some("d"));
 
-        // Longest match: Esc bound alone must not swallow an arrow.
+        // Whole keys: Esc bound alone is not an arrow.
         let c = Config::parse("[keys]\nprefix = \"C-a\"\n[keys.bindings]\nEsc = \"detach\"\nM-Up = \"zoom\"\nc = \"none\"", None)
             .unwrap();
         let k = &c.keys;
         assert_eq!(k.match_prefix(b"\x01"), Some(1));
-        assert_eq!(k.lookup(b"\x01"), Some((Action::SendPrefix, 1)));
-        assert_eq!(k.lookup(b"\x02"), None);
-        assert_eq!(k.lookup(b"\x1b"), Some((Action::Detach, 1)));
-        assert_eq!(k.lookup(b"\x1b[A"), Some((Action::FocusUp, 3)));
-        assert_eq!(k.lookup(b"\x1b[1;3A"), Some((Action::Zoom, 6)));
-        assert_eq!(k.lookup(b"\x1b\x1b[A"), Some((Action::Zoom, 4)));
-        assert_eq!(k.lookup(b"c"), None);
+        assert_eq!(k.bound(b"\x01"), Some(Action::SendPrefix));
+        assert_eq!(k.bound(b"\x02"), None);
+        assert_eq!(k.bound(b"\x1b"), Some(Action::Detach));
+        assert_eq!(k.bound(b"\x1b[A"), Some(Action::FocusUp));
+        assert_eq!(k.bound(b"\x1b[1;3A"), Some(Action::Zoom));
+        assert_eq!(k.bound(b"\x1b\x1b[A"), Some(Action::Zoom));
+        assert_eq!(k.bound(b"c"), None);
     }
 
     #[test]

@@ -157,11 +157,23 @@ impl App {
         let Some(tab) = layout.tabs.get(layout.active) else { return out };
         // Panes are drawn below the tab bar (row 0).
         if ev.y == 0 && self.drag.is_none() {
-            if ev.left_press()
-                && let Some(i) = super::render::tab_at(layout, ev.x)
-            {
-                self.exit_copy();
-                out.push(ClientMsg::SelectTab(i));
+            use super::render::BarHit;
+            if ev.left_press() {
+                match super::render::bar_hit(layout, self.term.0, ev.x) {
+                    Some(BarHit::Tab(i)) => {
+                        self.exit_copy();
+                        out.push(ClientMsg::SelectTab(i));
+                    }
+                    Some(BarHit::NewTab) => {
+                        self.exit_copy();
+                        self.input.open_new_tab_picker();
+                    }
+                    Some(BarHit::Session) => {
+                        self.input.mode = super::input::Mode::Overlay;
+                        self.on_action(crate::config::Action::SessionPicker, &mut out);
+                    }
+                    None => {}
+                }
             }
             return out;
         }

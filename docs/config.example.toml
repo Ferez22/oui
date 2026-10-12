@@ -69,8 +69,9 @@ s = "session-picker"
 [theme]
 base = "default"
 # Overrides on top of the base theme (values shown are the default theme's):
-# tab_bar_bg = "default"       # Tab bar background
-# tab_bar_fg = "default"       # Tab bar text
+# tab_bar_bg = 235             # Tab bar background (the whole top row)
+# tab_bar_fg = 252             # Tab bar text (tab numbers, names, session)
+# tab_inactive_bg = 238        # Background of inactive tabs and the + button
 # tab_active_bg = "profile"    # Active tab background
 # tab_active_fg = "black"      # Active tab text
 # status_bg = 236              # Status bar background

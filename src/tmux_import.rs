@@ -42,7 +42,6 @@ pub fn find_tmux_conf() -> Option<PathBuf> {
 
 /// The tmux config to offer importing on first launch: one exists and
 /// `~/.oui/config.toml` doesn't.
-#[allow(dead_code)] // used by the client's first-launch prompt
 pub fn should_offer() -> Option<PathBuf> {
     if config::path().ok()?.exists() {
         return None;
@@ -703,7 +702,7 @@ mod tests {
 
     fn action(c: &Config, key: &str) -> Option<Action> {
         let seq = config::key_bytes(key).unwrap().remove(0);
-        c.keys.lookup(&seq).filter(|(_, n)| *n == seq.len()).map(|(a, _)| a)
+        c.keys.bound(&seq)
     }
 
     const POPULAR: &str = r##"

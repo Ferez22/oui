@@ -11,7 +11,7 @@ mod panel;
 mod picker;
 mod render;
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::profile;
 use crate::protocol::{ClientMsg, Layout, ServerMsg, read_msg, socket_path, write_msg};
 use crate::workspace::WorkspaceSpec;
@@ -124,6 +124,50 @@ enum Overlay {
     Panel,
     Sessions(SessionPicker),
     Rename(Prompt),
+    /// A yes/no question; `y` runs the action, anything else cancels.
+    Confirm(Confirm),
+    /// Waiting for `ServerMsg::Busy` before closing a pane or tab.
+    Pending(Action),
+    /// First launch: offer to import the user's tmux config.
+    TmuxImport(TmuxOffer),
+}
+
+pub struct Confirm {
+    pub title: String,
+    pub text: String,
+    action: Action,
+}
+
+pub struct TmuxOffer {
+    /// The tmux config, `~`-relative.
+    pub shown: String,
+    pub result: crate::tmux_import::ImportResult,
+}
+
+/// `path` with the real home shown as `~`.
+fn tilde(path: &std::path::Path) -> String {
+    match profile::real_home().ok().and_then(|h| path.strip_prefix(h).ok().map(|p| p.to_path_buf())) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// Config written by "don't ask again" so the tmux import isn't offered again.
+const NO_IMPORT_CONFIG: &str = "# oUI config (~/.oui/config.toml). Created when you chose \"don't ask again\"\n\
+# for importing your tmux config. Import it any time with:\n\
+#   oui config import-tmux --write --force\n\
+# Every option, commented: oui config default\n";
+
+/// Last line printed after the TUI closes.
+fn goodbye(reason: &str) -> String {
+    if let Some(rest) = reason.strip_prefix("detached from session '") {
+        let name = rest.trim_end_matches('\'');
+        return format!("[oUI: {reason}. Your shells keep running; reattach with: oui attach {name}]");
+    }
+    if reason.starts_with("session '") && reason.ends_with("' ended") {
+        return format!("[oUI: {reason}. Bye! Run `oui` to start a new session.]");
+    }
+    format!("[oUI: {reason}]")
 }
 
 fn picker_options() -> Vec<(String, String)> {
@@ -220,6 +264,12 @@ async fn attach(
     }
     let mut input = Input::new(cwd.clone(), config.keys.clone(), config.general.default_profile.clone());
     input.mouse = mouse_on;
+    // First launch with a tmux config and no oUI config: offer to import it.
+    let offer = crate::tmux_import::should_offer()
+        .and_then(|path| crate::tmux_import::import_file(&path).ok().map(|result| TmuxOffer { shown: tilde(&path), result }));
+    if offer.is_some() {
+        input.mode = Mode::Overlay;
+    }
     let hostname = render::hostname();
     let (bg_tx, mut bg_rx) = unbounded_channel::<panel::Bg>();
     let panel = Panel::new(config.panel.visible);
@@ -231,7 +281,7 @@ async fn attach(
         config,
         hostname,
         panel,
-        overlay: None,
+        overlay: offer.map(Overlay::TmuxImport),
         term: (cols, rows),
         cwd: cwd.clone(),
         new_session_profile,
@@ -266,6 +316,8 @@ async fn attach(
                     app.flash = Some(f);
                 }
             }
+            // Repeat window over: redraw so the REPEAT badge goes away.
+            _ = repeat_end(app.input.repeat_until) => app.input.repeat_until = None,
             _ = tick.tick() => {
                 // Keep an open session picker's list current.
                 if matches!(app.overlay, Some(Overlay::Sessions(_))) {
@@ -303,13 +355,21 @@ async fn attach(
     };
 
     terminal::disable_raw_mode()?;
-    if mouse_on {
+    if app.input.mouse {
         print!("{}", mouse::DISABLE);
     }
     execute!(std::io::stdout(), terminal::LeaveAlternateScreen)?;
-    println!("[oUI: {reason}]");
+    println!("{}", goodbye(&reason));
     // The stdin thread is blocked on read; exit instead of joining it.
     std::process::exit(0);
+}
+
+/// Resolves when the repeat window `until` closes (never if there's none).
+async fn repeat_end(until: Option<std::time::Instant>) {
+    match until {
+        Some(t) => tokio::time::sleep_until(tokio::time::Instant::from_std(t)).await,
+        None => std::future::pending().await,
+    }
 }
 
 impl App {
@@ -357,6 +417,22 @@ impl App {
             ServerMsg::Sessions(list) => self.panel.sessions = list,
             ServerMsg::Clipboard(b64) => clipboard::copy_from_app(&b64),
             ServerMsg::Error(e) => self.flash = Some(e),
+            ServerMsg::Busy(busy) => {
+                let Some(Overlay::Pending(action)) = self.overlay else { return };
+                if busy.is_empty() {
+                    self.outbox.extend(Self::action_msg(action));
+                    self.close_overlay();
+                } else {
+                    let what = if action == Action::CloseTab { "tab" } else { "pane" };
+                    let list = busy.iter().map(|b| format!("'{b}'")).collect::<Vec<_>>().join(", ");
+                    let verb = if busy.len() == 1 { "is" } else { "are" };
+                    self.overlay = Some(Overlay::Confirm(Confirm {
+                        title: format!("close {what}"),
+                        text: format!("Close this {what}? {list} {verb} still running in it."),
+                        action,
+                    }));
+                }
+            }
             _ => {}
         }
     }
@@ -456,7 +532,106 @@ impl App {
         }
     }
 
+    /// The daemon message for a confirmed action.
+    fn action_msg(action: Action) -> Option<ClientMsg> {
+        match action {
+            Action::Detach => Some(ClientMsg::Detach),
+            Action::ClosePane => Some(ClientMsg::ClosePane),
+            Action::CloseTab => Some(ClientMsg::CloseTab),
+            _ => None,
+        }
+    }
+
+    /// Detach / close pane / close tab: ask first when it would end the
+    /// client (detach, last pane of the last tab, last tab) or kill a program
+    /// running in the pane (asks the daemon, see `ServerMsg::Busy`).
+    fn confirm_or_close(&mut self, action: Action, out: &mut Vec<ClientMsg>) {
+        let layout = self.layout.as_ref();
+        let session = layout.map_or(String::new(), |l| l.session.clone());
+        let tabs = layout.map_or(0, |l| l.tabs.len());
+        let panes = layout.and_then(|l| l.tabs.get(l.active)).map_or(0, |t| t.panes.len());
+        let ends = |title: &str| Confirm {
+            title: title.into(),
+            text: format!("Close oUI? This ends session '{session}' and its shells."),
+            action,
+        };
+        let confirm = match action {
+            Action::Detach => Confirm {
+                title: "detach".into(),
+                text: "Detach from oUI? Your shells keep running; reattach with `oui attach`.".into(),
+                action,
+            },
+            Action::ClosePane if tabs <= 1 && panes <= 1 => ends("close pane"),
+            Action::CloseTab if tabs <= 1 => ends("close tab"),
+            _ => {
+                out.push(ClientMsg::Busy { tab: action == Action::CloseTab });
+                self.overlay = Some(Overlay::Pending(action));
+                return;
+            }
+        };
+        self.overlay = Some(Overlay::Confirm(confirm));
+    }
+
+    /// Use a new config right away (after importing the tmux config): keys,
+    /// theme, status bar, panel settings, mouse.
+    fn apply_config(&mut self, config: Config) {
+        if config.general.mouse != self.input.mouse {
+            let mut out = std::io::stdout();
+            let _ = out.write_all(if config.general.mouse { mouse::ENABLE } else { mouse::DISABLE }.as_bytes());
+            let _ = out.flush();
+            self.input.mouse = config.general.mouse;
+        }
+        self.input.keys = config.keys.clone();
+        self.config = config;
+    }
+
+    fn tmux_key(&mut self, offer: TmuxOffer, key: &[u8]) {
+        match key {
+            b"y" | b"Y" => {
+                let r = &offer.result;
+                self.flash = Some(match crate::tmux_import::write_config(r, false).and_then(|_| Config::load()) {
+                    Ok(c) => {
+                        let prefix = render::display_key(&c.keys.prefix.notation);
+                        self.apply_config(c);
+                        format!(
+                            "imported {} setting(s) from {} (prefix {prefix}); default-shell/history-limit apply after `oui kill-server`",
+                            r.imported.len(),
+                            offer.shown
+                        )
+                    }
+                    Err(e) => format!("tmux import failed: {e:#}"),
+                });
+            }
+            b"d" | b"D" => {
+                let written = config::path().and_then(|p| {
+                    if let Some(dir) = p.parent() {
+                        std::fs::create_dir_all(dir)?;
+                    }
+                    std::fs::write(&p, NO_IMPORT_CONFIG)?;
+                    Ok(p)
+                });
+                self.flash = Some(match written {
+                    Ok(_) => "won't ask again; import later with `oui config import-tmux`".into(),
+                    Err(e) => format!("could not write config: {e:#}"),
+                });
+            }
+            b"n" | b"N" | b"\x1b" | b"q" | b"\x03" => {
+                self.flash = Some("tmux config not imported (asks again next time)".into());
+            }
+            _ => {
+                self.overlay = Some(Overlay::TmuxImport(offer));
+                return;
+            }
+        }
+        self.close_overlay();
+    }
+
     fn on_action(&mut self, action: Action, out: &mut Vec<ClientMsg>) {
+        if matches!(action, Action::Detach | Action::ClosePane | Action::CloseTab) {
+            self.input.mode = Mode::Overlay;
+            self.exit_copy();
+            return self.confirm_or_close(action, out);
+        }
         if matches!(action, Action::FocusPanel | Action::SessionPicker | Action::RenameTab) {
             // An earlier key of the same read may have closed another overlay.
             self.input.mode = Mode::Overlay;
@@ -498,6 +673,22 @@ impl App {
                 self.overlay = Some(Overlay::Panel);
                 self.panel_key(key, out);
             }
+            Some(Overlay::Confirm(c)) => {
+                if key == b"y" || key == b"Y" {
+                    out.extend(Self::action_msg(c.action));
+                }
+                self.close_overlay();
+            }
+            Some(Overlay::Pending(a)) => {
+                if key == b"\x1b" {
+                    self.close_overlay();
+                } else {
+                    // Typed while the daemon answers: still the pane's.
+                    self.overlay = Some(Overlay::Pending(a));
+                    out.push(ClientMsg::Input(key.to_vec()));
+                }
+            }
+            Some(Overlay::TmuxImport(offer)) => self.tmux_key(offer, key),
             Some(Overlay::Rename(mut p)) => match p.key(key) {
                 PromptOutcome::Pending => self.overlay = Some(Overlay::Rename(p)),
                 PromptOutcome::Cancel => self.close_overlay(),
