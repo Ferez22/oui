@@ -137,4 +137,87 @@ wait_for "default_profile: profile 'ghost' not found" "and warns in the status b
 t send-keys C-a d
 wait_for 'detached from session' "detach"
 
+# --- Scrollback, copy mode, mouse, clipboard (default keys, mouse on).
+"$bin" kill-server >/dev/null
+printf '[general]\ndefault_profile = "personal"\nscrollback = 2000\n' >"$OUI_HOME/config.toml"
+clip=$dir/clipboard.txt
+# raw <bytes>: inject raw bytes (mouse reports) as if typed in the host terminal.
+raw() { t send-keys -H $(printf '%b' "$1" | od -An -tx1); }
+# clip_is <text> <what>: the clipboard test hook file holds exactly <text>.
+clip_is() {
+    for _ in $(seq 50); do
+        if [ "$(cat "$clip" 2>/dev/null)" = "$1" ]; then echo "ok   $2"; return; fi
+        sleep 0.1
+    done
+    echo "FAIL $2 (clipboard: $(cat "$clip" 2>/dev/null))" >&2; exit 1
+}
+t kill-session -t g
+t new -d -s m -x 120 -y 30 "OUI_CLIPBOARD_FILE='$clip' '$bin' new -s copy; sleep 60"
+t set-option -g set-clipboard on # OSC 52 from oUI lands in this server's paste buffer
+wait_for '^\$' "shell prompt"
+t send-keys 'seq 1 500' Enter
+wait_for '^500$' "seq output"
+t send-keys C-b [
+wait_for ' COPY ' "copy mode shows in the status bar"
+wait_for '\[0/[0-9]+\]' "position indicator at the bottom"
+t send-keys g
+wait_for '^1$' "g scrolls to the top of the history"
+wait_for '\[4[0-9][0-9]/4[0-9][0-9]\]' "indicator shows the scroll offset"
+t send-keys / 2 3 4 Enter
+wait_for '^234$' "search finds a line"
+t send-keys V j y
+clip_is "$(printf '234\n235')" "line selection yanked to the clipboard"
+if t show-buffer 2>/dev/null | grep -q '^235$'; then echo "ok   OSC 52 reached the host terminal"; else
+    echo "FAIL OSC 52 reached the host terminal" >&2; exit 1; fi
+for _ in $(seq 50); do screen | grep -q ' COPY ' || break; sleep 0.1; done
+wait_for '^500$' "yank leaves copy mode at the bottom"
+t send-keys C-b [ ? 1 2 0 Enter v e y
+clip_is "120" "backward search + char selection"
+
+t send-keys 'clear' Enter
+wait_for '^\$$' "clear"
+raw '\e[<64;10;10M\e[<64;10;10M'
+wait_for '\[6/[0-9]+\]' "mouse wheel scrolls into history"
+raw '\e[<65;10;10M\e[<65;10;10M'
+for _ in $(seq 50); do screen | grep -q ' COPY ' || break; sleep 0.1; done
+if screen | grep -q ' COPY '; then echo "FAIL wheel back to the bottom leaves scroll view" >&2; screen >&2; exit 1; fi
+echo "ok   wheel back to the bottom leaves scroll view"
+
+t send-keys 'clear; echo DRAGME' Enter
+wait_for '^DRAGME' "text to drag over"
+raw '\e[<0;1;2M\e[<32;4;2M\e[<32;6;2M\e[<0;6;2m'
+clip_is "DRAGME" "mouse drag selects and copies"
+
+t send-keys C-b %
+wait_for '│\$' "split for click focus"
+raw '\e[<0;5;5M\e[<0;5;5m'
+t send-keys 'echo CLICK-$((6*7))' Enter
+wait_for '^CLICK-42' "click focuses the left pane"
+raw '\e[<0;100;5M\e[<0;100;5m'
+t send-keys 'printf "\\033[?1000h\\033[?1006h"; cat -v' Enter
+sleep 0.3
+raw '\e[<0;70;6M\e[<0;70;6m'
+wait_for '│\^\[\[<0;[0-9]+;5M' "mouse reports go to an app that asked for them (pane-relative)"
+t send-keys C-c
+
+t send-keys C-b c Enter
+wait_for 'oUI +1 personal +2 personal' "second tab"
+raw '\e[<0;8;1M\e[<0;8;1m'
+wait_for '^CLICK-42' "click on a tab selects it"
+t send-keys C-b d
+wait_for 'detached from session' "detach"
+
+# Reattached clients get the history from the daemon; apps' OSC 52 is forwarded.
+t kill-session -t m
+t new -d -s r -x 120 -y 30 "OUI_CLIPBOARD_FILE='$clip' '$bin' attach copy; sleep 60"
+wait_for '^CLICK-42' "reattach"
+raw '\e[<0;5;5M\e[<0;5;5m'
+t send-keys C-b [ g
+wait_for '^1 +│' "history from the daemon after reattach"
+t send-keys q
+t send-keys "printf '\\033]52;c;%s\\007' \$(printf APPCLIP | base64)" Enter
+clip_is "APPCLIP" "OSC 52 from an app in a pane reaches the clipboard"
+t send-keys C-b d
+wait_for 'detached from session' "detach"
+
 echo "all e2e checks passed (temp dirs: $dir $sockdir)"

@@ -7,6 +7,7 @@ mod daemon;
 mod layout;
 mod profile;
 mod protocol;
+mod scrollback;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

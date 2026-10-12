@@ -25,9 +25,30 @@ Inside a tab, log in as usual (`claude` → `/login`, `railway login`, `gh auth 
 | `Ctrl-b x` / `&` | close pane / close tab |
 | `Ctrl-b d` | detach (shells keep running) |
 | `Ctrl-b Ctrl-b` | send a literal Ctrl-b |
-| `Ctrl-b b` / `[` / `s` / `,` | right panel / copy mode / session picker / rename tab (coming soon) |
+| `Ctrl-b [` | copy mode: scroll back, search, select, copy (below) |
+| `Ctrl-b b` / `s` / `,` | right panel / session picker / rename tab (coming soon) |
 
 The prefix and every key above can be changed in the config file.
+
+### Copy mode, mouse, clipboard
+`Ctrl-b [` opens the focused pane's scrollback (`general.scrollback` lines, default 10000); `[offset/total]` shows the position and output keeps arriving without moving the view.
+
+| Copy mode keys | Action |
+|---|---|
+| `h j k l` / arrows | move |
+| `w` `b` `e` | next word / previous word / end of word |
+| `0` `^` `$` | line start / first non-blank / line end |
+| `g` / `G` | top of history / bottom |
+| `H` `M` `L` | top / middle / bottom of the view |
+| `Ctrl-u` / `Ctrl-d`, `PgUp` / `PgDn` | half page / page up and down |
+| `/` `?` then `n` / `N` | search forward / backward, next / previous (lowercase = ignore case) |
+| `v` / `V` | start character / line selection |
+| `y` or `Enter` | copy the selection and leave |
+| `q` / `Esc` | leave (the prefix also leaves, then works as usual) |
+
+With `general.mouse = true` (default): the wheel scrolls a pane's history (scrolling back to the bottom leaves), click focuses a pane or selects a tab, drag selects text and copies it on release. Apps that use the mouse themselves (vim with `mouse=a`, htop, …) get the mouse events instead. Hold **Shift** to use your terminal's own selection (Option/Alt in some macOS terminals).
+
+Copying uses OSC 52, so it reaches your local clipboard even over ssh (enable it in your terminal if needed; payloads over 100 KB are skipped), plus `pbcopy` / `wl-copy` / `xclip` when installed. Apps in a pane that set the clipboard with OSC 52 (e.g. neovim, tmux inside oUI) go through the same path.
 
 ```bash
 oui ls                    # list sessions

@@ -2,7 +2,10 @@
 //!
 //! `input` turns raw stdin into daemon messages, `render` draws the screen.
 
+mod clipboard;
+mod copy;
 mod input;
+mod mouse;
 mod render;
 
 use crate::config::Config;
@@ -13,8 +16,8 @@ use input::{Input, Mode};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::{execute, terminal};
-use std::collections::HashMap;
-use std::io::Read;
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -90,6 +93,15 @@ struct App {
     config: Config,
     /// Status bar `hostname` segment (looked up once).
     hostname: String,
+    // --- Copy mode / mouse.
+    copy: Option<copy::Copy>,
+    drag: Option<mouse::Drag>,
+    /// Pane cell where the current drag started.
+    drag_start: (u16, u16),
+    /// Panes whose parser holds the daemon's scrollback (`ServerMsg::History`).
+    have_history: HashSet<u32>,
+    /// Messages produced while handling server messages, sent by the main loop.
+    outbox: Vec<ClientMsg>,
 }
 
 fn picker_options() -> Vec<(String, String)> {
@@ -159,9 +171,28 @@ pub async fn run(session: Option<String>, create: bool, profile: Option<String>)
     terminal::enable_raw_mode()?;
     execute!(std::io::stdout(), terminal::EnterAlternateScreen)?;
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
-    let input = Input::new(cwd.clone(), config.keys.clone(), config.general.default_profile.clone());
+    let mouse_on = config.general.mouse;
+    if mouse_on {
+        let mut out = std::io::stdout();
+        out.write_all(mouse::ENABLE.as_bytes())?;
+        out.flush()?;
+    }
+    let mut input = Input::new(cwd.clone(), config.keys.clone(), config.general.default_profile.clone());
+    input.mouse = mouse_on;
     let hostname = render::hostname();
-    let mut app = App { layout: None, screens: HashMap::new(), input, flash, config, hostname };
+    let mut app = App {
+        layout: None,
+        screens: HashMap::new(),
+        input,
+        flash,
+        config,
+        hostname,
+        copy: None,
+        drag: None,
+        drag_start: (0, 0),
+        have_history: HashSet::new(),
+        outbox: Vec::new(),
+    };
     // Redraw at least every second so the clock segment stays current.
     let mut tick = tokio::time::interval(Duration::from_secs(1));
 
@@ -177,6 +208,9 @@ pub async fn run(session: Option<String>, create: bool, profile: Option<String>)
                     app.flash = None;
                 }
                 for msg in app.input.feed(&bytes) {
+                    write_msg(&mut wr, &msg).await?;
+                }
+                for msg in app.on_events() {
                     write_msg(&mut wr, &msg).await?;
                 }
                 if let Some(f) = app.input.flash.take() {
@@ -203,10 +237,16 @@ pub async fn run(session: Option<String>, create: bool, profile: Option<String>)
         if let Some(reason) = exit {
             break reason;
         }
+        for msg in std::mem::take(&mut app.outbox) {
+            write_msg(&mut wr, &msg).await?;
+        }
         term.draw(|f| render::draw(&app, f))?;
     };
 
     terminal::disable_raw_mode()?;
+    if mouse_on {
+        print!("{}", mouse::DISABLE);
+    }
     execute!(std::io::stdout(), terminal::LeaveAlternateScreen)?;
     println!("[oUI: {reason}]");
     // The stdin thread is blocked on read; exit instead of joining it.
@@ -221,17 +261,64 @@ impl App {
                 self.layout = Some(l);
             }
             ServerMsg::Snapshot { pane, rows, cols, data } => {
-                let mut p = vt100::Parser::new(rows, cols, 0);
+                // Keep scrollback locally too, so history grows with output.
+                let mut p = vt100::Parser::new(rows, cols, self.config.general.scrollback);
                 p.process(&data);
                 self.screens.insert(pane, p);
+                self.have_history.remove(&pane);
+                // Size changed under copy mode: positions are meaningless now.
+                if self.copy.as_ref().is_some_and(|c| c.pane == pane) {
+                    self.exit_copy();
+                }
+            }
+            ServerMsg::History { pane, rows, cols, history, data } => {
+                let mut p = vt100::Parser::new(rows, cols, self.config.general.scrollback.max(history as usize));
+                p.process(&data);
+                let old = self.screens.insert(pane, p);
+                self.have_history.insert(pane);
+                if let (Some(c), Some(mut old)) = (self.copy.as_mut().filter(|c| c.pane == pane), old) {
+                    let old_off = old.screen().scrollback();
+                    let old_hist = crate::scrollback::history_len(old.screen_mut());
+                    if let Some(p) = self.screens.get_mut(&pane) {
+                        c.on_history(p, old_hist, old_off);
+                    }
+                    for k in std::mem::take(&mut c.queued) {
+                        self.copy_key(&k);
+                    }
+                }
             }
             ServerMsg::Output { pane, data } => {
                 if let Some(p) = self.screens.get_mut(&pane) {
                     p.process(&data);
+                    if let Some(c) = self.copy.as_mut().filter(|c| c.pane == pane) {
+                        c.sync(p);
+                    }
                 }
             }
+            ServerMsg::Clipboard(b64) => clipboard::copy_from_app(&b64),
             ServerMsg::Error(e) => self.flash = Some(e),
             _ => {}
         }
+    }
+
+    /// Drain the input events `Input::feed` queued (copy keys, mouse).
+    fn on_events(&mut self) -> Vec<ClientMsg> {
+        let mut out = Vec::new();
+        for ev in std::mem::take(&mut self.input.events) {
+            match ev {
+                input::Event::EnterCopy => {
+                    let focused = self.layout.as_ref().and_then(|l| l.tabs.get(l.active)).map(|t| t.focused);
+                    match focused {
+                        Some(pane) => self.enter_copy(pane, false),
+                        None => self.input.mode = Mode::Normal,
+                    }
+                }
+                input::Event::ExitCopy => self.exit_copy(), // input is in prefix mode already
+                input::Event::CopyKey(k) => self.copy_key(&k),
+                input::Event::Mouse(ev) => out.extend(self.on_mouse(ev)),
+            }
+        }
+        out.append(&mut self.outbox);
+        out
     }
 }

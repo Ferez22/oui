@@ -41,6 +41,15 @@ pub enum ClientMsg {
     ListSessions,
     KillSession(String),
     KillServer,
+    // --- Scrollback / mouse (copy mode).
+    /// Ask for a pane's screen *with* its scrollback; answered with `History`
+    /// to this client only.
+    History(u32),
+    /// Focus a pane of the active tab by id (mouse click).
+    FocusPane(u32),
+    /// Input for a specific pane of the client's session, focused or not
+    /// (mouse events forwarded to an app under the pointer).
+    PaneInput { pane: u32, #[serde(with = "serde_bytes")] data: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -85,6 +94,12 @@ pub enum ServerMsg {
     /// Client should exit (detached, session ended, server killed).
     Exit(String),
     Ok,
+    // --- Scrollback / clipboard.
+    /// Like `Snapshot`, but `data` first replays `history` scrollback lines so
+    /// a parser with enough scrollback ends up with the daemon's history too.
+    History { pane: u32, rows: u16, cols: u16, history: u32, #[serde(with = "serde_bytes")] data: Vec<u8> },
+    /// An app in a pane set the clipboard (OSC 52); base64 payload as sent.
+    Clipboard(#[serde(with = "serde_bytes")] Vec<u8>),
 }
 
 pub async fn write_msg<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> Result<()> {
