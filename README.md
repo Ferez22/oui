@@ -17,4 +17,4 @@ oui run personal -- railway whoami
 Each profile gets its own `HOME` and XDG directories (plus small per-tool adapters), so any CLI's normal login command logs in **for that profile only**.
 
 ## License
-MIT OR Apache-2.0
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
